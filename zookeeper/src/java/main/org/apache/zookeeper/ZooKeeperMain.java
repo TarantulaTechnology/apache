@@ -47,6 +47,7 @@ import org.apache.zookeeper.cli.CreateCommand;
 import org.apache.zookeeper.cli.DelQuotaCommand;
 import org.apache.zookeeper.cli.DeleteAllCommand;
 import org.apache.zookeeper.cli.DeleteCommand;
+import org.apache.zookeeper.cli.RemoveWatchesCommand;
 import org.apache.zookeeper.cli.GetAclCommand;
 import org.apache.zookeeper.cli.GetCommand;
 import org.apache.zookeeper.cli.GetConfigCommand;
@@ -109,6 +110,7 @@ public class ZooKeeperMain {
         new AddAuthCommand().addToMap(commandMapCli);
         new ReconfigCommand().addToMap(commandMapCli);
         new GetConfigCommand().addToMap(commandMapCli);
+        new RemoveWatchesCommand().addToMap(commandMapCli);
         
         // add all to commandMap
         for (Entry<String, CliCommand> entry : commandMapCli.entrySet()) {
@@ -262,6 +264,10 @@ public class ZooKeeperMain {
         }
         host = newHost;
         boolean readOnly = cl.getOption("readonly") != null;
+        if (cl.getOption("secure") != null) {
+            System.setProperty(ZooKeeper.SECURE_CLIENT, "true");
+            System.out.println("Secure connection is enabled");
+        }
         zk = new ZooKeeper(host,
                  Integer.parseInt(cl.getOption("timeout")),
                  new MyWatcher(), readOnly);
@@ -293,9 +299,9 @@ public class ZooKeeperMain {
             boolean jlinemissing = false;
             // only use jline if it's in the classpath
             try {
-                Class<?> consoleC = Class.forName("jline.ConsoleReader");
+                Class<?> consoleC = Class.forName("jline.console.ConsoleReader");
                 Class<?> completorC =
-                    Class.forName("org.apache.zookeeper.JLineZNodeCompletor");
+                    Class.forName("org.apache.zookeeper.JLineZNodeCompleter");
 
                 System.out.println("JLine support is enabled");
 
@@ -304,8 +310,8 @@ public class ZooKeeperMain {
 
                 Object completor =
                     completorC.getConstructor(ZooKeeper.class).newInstance(zk);
-                Method addCompletor = consoleC.getMethod("addCompletor",
-                        Class.forName("jline.Completor"));
+                Method addCompletor = consoleC.getMethod("addCompleter",
+                        Class.forName("jline.console.completer.Completer"));
                 addCompletor.invoke(console, completor);
 
                 String line;
@@ -340,6 +346,9 @@ public class ZooKeeperMain {
                     executeLine(line);
                 }
             }
+        } else {
+            // Command line args non-null.  Run what was passed.
+            processCmd(cl);
         }
     }
 

@@ -17,15 +17,25 @@
  */
 package org.apache.cassandra.cql3.statements;
 
-import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
 
-import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.CompactTables;
+import org.apache.cassandra.db.Slice;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkContainsNoDuplicates;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkTrue;
 
 /**
  * An <code>UPDATE</code> statement parsed from a CQL query statement.
@@ -33,145 +43,234 @@ import org.apache.cassandra.utils.Pair;
  */
 public class UpdateStatement extends ModificationStatement
 {
-    private static final Operation setToEmptyOperation = new Constants.Setter(null, new Constants.Value(ByteBufferUtil.EMPTY_BYTE_BUFFER));
+    private static final Constants.Value EMPTY = new Constants.Value(ByteBufferUtil.EMPTY_BYTE_BUFFER);
 
-    private UpdateStatement(int boundTerms, CFMetaData cfm, Attributes attrs)
+    private UpdateStatement(StatementType type,
+                            int boundTerms,
+                            CFMetaData cfm,
+                            Operations operations,
+                            StatementRestrictions restrictions,
+                            Conditions conditions,
+                            Attributes attrs)
     {
-        super(boundTerms, cfm, attrs);
+        super(type, boundTerms, cfm, operations, restrictions, conditions, attrs);
     }
 
-    protected boolean requireFullClusteringKey()
+    public boolean requireFullClusteringKey()
     {
         return true;
     }
 
-    public ColumnFamily updateForKey(ByteBuffer key, ColumnNameBuilder builder, UpdateParameters params)
-    throws InvalidRequestException
+    @Override
+    public void addUpdateForKey(PartitionUpdate update, Clustering clustering, UpdateParameters params)
     {
-        CFDefinition cfDef = cfm.getCfDef();
-        ColumnFamily cf = UnsortedColumns.factory.create(cfm);
-
-        // Inserting the CQL row marker (see #4361)
-        // We always need to insert a marker, because of the following situation:
-        //   CREATE TABLE t ( k int PRIMARY KEY, c text );
-        //   INSERT INTO t(k, c) VALUES (1, 1)
-        //   DELETE c FROM t WHERE k = 1;
-        //   SELECT * FROM t;
-        // The last query should return one row (but with c == null). Adding
-        // the marker with the insert make sure the semantic is correct (while making sure a
-        // 'DELETE FROM t WHERE k = 1' does remove the row entirely)
-        //
-        // We never insert markers for Super CF as this would confuse the thrift side.
-        if (cfDef.isComposite && !cfDef.isCompact && !cfm.isSuper())
+        if (updatesRegularRows())
         {
-            ByteBuffer name = builder.copy().add(ByteBufferUtil.EMPTY_BYTE_BUFFER).build();
-            cf.addColumn(params.makeColumn(name, ByteBufferUtil.EMPTY_BYTE_BUFFER));
-        }
+            params.newRow(clustering);
 
-        List<Operation> updates = getOperations();
+            // We update the row timestamp (ex-row marker) only on INSERT (#6782)
+            // Further, COMPACT tables semantic differs from "CQL3" ones in that a row exists only if it has
+            // a non-null column, so we don't want to set the row timestamp for them.
+            if (type.isInsert() && cfm.isCQLTable())
+                params.addPrimaryKeyLivenessInfo();
 
-        if (cfDef.isCompact)
-        {
-            if (builder.componentCount() == 0)
-                throw new InvalidRequestException(String.format("Missing PRIMARY KEY part %s", cfDef.columns.values().iterator().next()));
+            List<Operation> updates = getRegularOperations();
 
-            if (cfDef.value == null)
+            // For compact table, when we translate it to thrift, we don't have a row marker. So we don't accept an insert/update
+            // that only sets the PK unless the is no declared non-PK columns (in the latter we just set the value empty).
+
+            // For a dense layout, when we translate it to thrift, we don't have a row marker. So we don't accept an insert/update
+            // that only sets the PK unless the is no declared non-PK columns (which we recognize because in that case the compact
+            // value is of type "EmptyType").
+            if (cfm.isCompactTable() && updates.isEmpty())
             {
-                // compact + no compact value implies there is no column outside the PK. So no operation could
-                // have passed through validation
-                assert updates.isEmpty();
-                setToEmptyOperation.execute(key, cf, builder.copy(), params);
-            }
-            else
-            {
-                // compact means we don't have a row marker, so don't accept to set only the PK. See CASSANDRA-5648.
-                if (updates.isEmpty())
-                    throw new InvalidRequestException(String.format("Column %s is mandatory for this COMPACT STORAGE table", cfDef.value));
+                checkTrue(CompactTables.hasEmptyCompactValue(cfm),
+                          "Column %s is mandatory for this COMPACT STORAGE table",
+                          cfm.compactValueColumn().name);
 
-                for (Operation update : updates)
-                    update.execute(key, cf, builder.copy(), params);
+                updates = Collections.<Operation>singletonList(new Constants.Setter(cfm.compactValueColumn(), EMPTY));
             }
+
+            for (Operation op : updates)
+                op.execute(update.partitionKey(), params);
+
+            update.add(params.buildRow());
         }
-        else
+
+        if (updatesStaticRow())
         {
-            for (Operation update : updates)
-                update.execute(key, cf, builder.copy(), params);
+            params.newRow(Clustering.STATIC_CLUSTERING);
+            for (Operation op : getStaticOperations())
+                op.execute(update.partitionKey(), params);
+            update.add(params.buildRow());
         }
 
-        return cf;
+        params.validateIndexedColumns(update);
+    }
+
+    @Override
+    public void addUpdateForKey(PartitionUpdate update, Slice slice, UpdateParameters params)
+    {
+        throw new UnsupportedOperationException();
     }
 
     public static class ParsedInsert extends ModificationStatement.Parsed
     {
-        private final List<ColumnIdentifier> columnNames;
+        private final List<ColumnIdentifier.Raw> columnNames;
         private final List<Term.Raw> columnValues;
 
         /**
          * A parsed <code>INSERT</code> statement.
          *
          * @param name column family being operated on
+         * @param attrs additional attributes for statement (CL, timestamp, timeToLive)
          * @param columnNames list of column names
          * @param columnValues list of column values (corresponds to names)
-         * @param attrs additional attributes for statement (CL, timestamp, timeToLive)
+         * @param ifNotExists true if an IF NOT EXISTS condition was specified, false otherwise
          */
         public ParsedInsert(CFName name,
                             Attributes.Raw attrs,
-                            List<ColumnIdentifier> columnNames, List<Term.Raw> columnValues,
+                            List<ColumnIdentifier.Raw> columnNames,
+                            List<Term.Raw> columnValues,
                             boolean ifNotExists)
         {
-            super(name, attrs, null, ifNotExists);
+            super(name, attrs, null, ifNotExists, false);
             this.columnNames = columnNames;
             this.columnValues = columnValues;
         }
 
-        protected ModificationStatement prepareInternal(CFDefinition cfDef, ColumnSpecification[] boundNames, Attributes attrs) throws InvalidRequestException
+        @Override
+        protected ModificationStatement prepareInternal(CFMetaData cfm,
+                                                        VariableSpecifications boundNames,
+                                                        Conditions conditions,
+                                                        Attributes attrs)
         {
-            UpdateStatement stmt = new UpdateStatement(getBoundsTerms(), cfDef.cfm, attrs);
 
             // Created from an INSERT
-            if (stmt.isCounter())
-                throw new InvalidRequestException("INSERT statement are not allowed on counter tables, use UPDATE instead");
-            if (columnNames.size() != columnValues.size())
-                throw new InvalidRequestException("Unmatched column names/values");
-            if (columnNames.isEmpty())
-                throw new InvalidRequestException("No columns provided to INSERT");
+            checkFalse(cfm.isCounter(), "INSERT statements are not allowed on counter tables, use UPDATE instead");
+
+            checkFalse(columnNames == null, "Column names for INSERT must be provided when using VALUES");
+            checkFalse(columnNames.isEmpty(), "No columns provided to INSERT");
+            checkFalse(columnNames.size() != columnValues.size(), "Unmatched column names/values");
+            checkContainsNoDuplicates(columnNames, "The column names contains duplicates");
+
+            List<Relation> relations = new ArrayList<>();
+            Operations operations = new Operations();
+            boolean hasClusteringColumnsSet = false;
 
             for (int i = 0; i < columnNames.size(); i++)
             {
-                CFDefinition.Name name = cfDef.get(columnNames.get(i));
-                if (name == null)
-                    throw new InvalidRequestException(String.format("Unknown identifier %s", columnNames.get(i)));
+                ColumnDefinition def = getColumnDefinition(cfm, columnNames.get(i));
 
-                for (int j = 0; j < i; j++)
-                    if (name.name.equals(columnNames.get(j)))
-                        throw new InvalidRequestException(String.format("Multiple definitions found for column %s", name));
+                if (def.isClusteringColumn())
+                    hasClusteringColumnsSet = true;
 
                 Term.Raw value = columnValues.get(i);
 
-                switch (name.kind)
+                if (def.isPrimaryKeyColumn())
                 {
-                    case KEY_ALIAS:
-                    case COLUMN_ALIAS:
-                        Term t = value.prepare(name);
-                        t.collectMarkerSpecification(boundNames);
-                        stmt.addKeyValue(name.name, t);
-                        break;
-                    case VALUE_ALIAS:
-                    case COLUMN_METADATA:
-                        Operation operation = new Operation.SetValue(value).prepare(name);
-                        operation.collectMarkerSpecification(boundNames);
-                        stmt.addOperation(operation);
-                        break;
+                    relations.add(new SingleColumnRelation(columnNames.get(i), Operator.EQ, value));
+                }
+                else
+                {
+                    Operation operation = new Operation.SetValue(value).prepare(keyspace(), def);
+                    operation.collectMarkerSpecification(boundNames);
+                    operations.add(operation);
                 }
             }
-            return stmt;
+
+            boolean applyOnlyToStaticColumns = appliesOnlyToStaticColumns(operations, conditions) && !hasClusteringColumnsSet;
+
+            StatementRestrictions restrictions = new StatementRestrictions(StatementType.INSERT,
+                                                                           cfm,
+                                                                           relations,
+                                                                           boundNames,
+                                                                           applyOnlyToStaticColumns,
+                                                                           false,
+                                                                           false);
+
+            return new UpdateStatement(StatementType.INSERT,
+                                       boundNames.size(),
+                                       cfm,
+                                       operations,
+                                       restrictions,
+                                       conditions,
+                                       attrs);
+        }
+    }
+
+    /**
+     * A parsed INSERT JSON statement.
+     */
+    public static class ParsedInsertJson extends ModificationStatement.Parsed
+    {
+        private final Json.Raw jsonValue;
+
+        public ParsedInsertJson(CFName name, Attributes.Raw attrs, Json.Raw jsonValue, boolean ifNotExists)
+        {
+            super(name, attrs, null, ifNotExists, false);
+            this.jsonValue = jsonValue;
+        }
+
+        @Override
+        protected ModificationStatement prepareInternal(CFMetaData cfm,
+                                                        VariableSpecifications boundNames,
+                                                        Conditions conditions,
+                                                        Attributes attrs)
+        {
+            checkFalse(cfm.isCounter(), "INSERT statements are not allowed on counter tables, use UPDATE instead");
+
+            Collection<ColumnDefinition> defs = cfm.allColumns();
+            Json.Prepared prepared = jsonValue.prepareAndCollectMarkers(cfm, defs, boundNames);
+
+            List<Relation> relations = new ArrayList<>();
+            Operations operations = new Operations();
+            boolean hasClusteringColumnsSet = false;
+
+            for (ColumnDefinition def : defs)
+            {
+                if (def.isClusteringColumn())
+                    hasClusteringColumnsSet = true;
+
+                Term.Raw raw = prepared.getRawTermForColumn(def);
+                if (def.isPrimaryKeyColumn())
+                {
+                    relations.add(new SingleColumnRelation(new ColumnIdentifier.ColumnIdentifierValue(def.name),
+                                                           Operator.EQ,
+                                                           raw));
+                }
+                else
+                {
+                    Operation operation = new Operation.SetValue(raw).prepare(keyspace(), def);
+                    operation.collectMarkerSpecification(boundNames);
+                    operations.add(operation);
+                }
+            }
+
+            boolean applyOnlyToStaticColumns = appliesOnlyToStaticColumns(operations, conditions) && !hasClusteringColumnsSet;
+
+            StatementRestrictions restrictions = new StatementRestrictions(StatementType.INSERT,
+                                                                           cfm,
+                                                                           relations,
+                                                                           boundNames,
+                                                                           applyOnlyToStaticColumns,
+                                                                           false,
+                                                                           false);
+
+            return new UpdateStatement(StatementType.INSERT,
+                                       boundNames.size(),
+                                       cfm,
+                                       operations,
+                                       restrictions,
+                                       conditions,
+                                       attrs);
         }
     }
 
     public static class ParsedUpdate extends ModificationStatement.Parsed
     {
         // Provided for an UPDATE
-        private final List<Pair<ColumnIdentifier, Operation.RawUpdate>> updates;
+        private final List<Pair<ColumnIdentifier.Raw, Operation.RawUpdate>> updates;
         private final List<Relation> whereClause;
 
         /**
@@ -182,45 +281,53 @@ public class UpdateStatement extends ModificationStatement
          * @param attrs additional attributes for statement (timestamp, timeToLive)
          * @param updates a map of column operations to perform
          * @param whereClause the where clause
-         */
+         * @param ifExists flag to check if row exists
+         * */
         public ParsedUpdate(CFName name,
                             Attributes.Raw attrs,
-                            List<Pair<ColumnIdentifier, Operation.RawUpdate>> updates,
+                            List<Pair<ColumnIdentifier.Raw, Operation.RawUpdate>> updates,
                             List<Relation> whereClause,
-                            List<Pair<ColumnIdentifier, Operation.RawUpdate>> conditions)
+                            List<Pair<ColumnIdentifier.Raw, ColumnCondition.Raw>> conditions,
+                            boolean ifExists)
         {
-            super(name, attrs, conditions, false);
+            super(name, attrs, conditions, false, ifExists);
             this.updates = updates;
             this.whereClause = whereClause;
         }
 
-        protected ModificationStatement prepareInternal(CFDefinition cfDef, ColumnSpecification[] boundNames, Attributes attrs) throws InvalidRequestException
+        @Override
+        protected ModificationStatement prepareInternal(CFMetaData cfm,
+                                                        VariableSpecifications boundNames,
+                                                        Conditions conditions,
+                                                        Attributes attrs)
         {
-            UpdateStatement stmt = new UpdateStatement(getBoundsTerms(), cfDef.cfm, attrs);
+            Operations operations = new Operations();
 
-            for (Pair<ColumnIdentifier, Operation.RawUpdate> entry : updates)
+            for (Pair<ColumnIdentifier.Raw, Operation.RawUpdate> entry : updates)
             {
-                CFDefinition.Name name = cfDef.get(entry.left);
-                if (name == null)
-                    throw new InvalidRequestException(String.format("Unknown identifier %s", entry.left));
+                ColumnDefinition def = getColumnDefinition(cfm, entry.left);
 
-                Operation operation = entry.right.prepare(name);
+                checkFalse(def.isPrimaryKeyColumn(), "PRIMARY KEY part %s found in SET part", def.name);
+
+                Operation operation = entry.right.prepare(keyspace(), def);
                 operation.collectMarkerSpecification(boundNames);
-
-                switch (name.kind)
-                {
-                    case KEY_ALIAS:
-                    case COLUMN_ALIAS:
-                        throw new InvalidRequestException(String.format("PRIMARY KEY part %s found in SET part", entry.left));
-                    case VALUE_ALIAS:
-                    case COLUMN_METADATA:
-                        stmt.addOperation(operation);
-                        break;
-                }
+                operations.add(operation);
             }
 
-            stmt.processWhereClause(whereClause, boundNames);
-            return stmt;
+            StatementRestrictions restrictions = newRestrictions(StatementType.UPDATE,
+                                                                 cfm,
+                                                                 boundNames,
+                                                                 operations,
+                                                                 whereClause,
+                                                                 conditions);
+
+            return new UpdateStatement(StatementType.UPDATE,
+                                       boundNames.size(),
+                                       cfm,
+                                       operations,
+                                       restrictions,
+                                       conditions,
+                                       attrs);
         }
     }
 }

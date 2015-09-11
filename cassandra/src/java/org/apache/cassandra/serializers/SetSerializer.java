@@ -28,70 +28,83 @@ public class SetSerializer<T> extends CollectionSerializer<Set<T>>
     private static final Map<TypeSerializer<?>, SetSerializer> instances = new HashMap<TypeSerializer<?>, SetSerializer>();
 
     public final TypeSerializer<T> elements;
+    private final Comparator<ByteBuffer> comparator;
 
-    public static synchronized <T> SetSerializer<T> getInstance(TypeSerializer<T> elements)
+    public static synchronized <T> SetSerializer<T> getInstance(TypeSerializer<T> elements, Comparator<ByteBuffer> elementComparator)
     {
         SetSerializer<T> t = instances.get(elements);
         if (t == null)
         {
-            t = new SetSerializer<T>(elements);
+            t = new SetSerializer<T>(elements, elementComparator);
             instances.put(elements, t);
         }
         return t;
     }
 
-    private SetSerializer(TypeSerializer<T> elements)
+    private SetSerializer(TypeSerializer<T> elements, Comparator<ByteBuffer> comparator)
     {
         this.elements = elements;
+        this.comparator = comparator;
     }
 
-    public Set<T> deserialize(ByteBuffer bytes)
+    public List<ByteBuffer> serializeValues(Set<T> values)
+    {
+        List<ByteBuffer> buffers = new ArrayList<>(values.size());
+        for (T value : values)
+            buffers.add(elements.serialize(value));
+        Collections.sort(buffers, comparator);
+        return buffers;
+    }
+
+    public int getElementCount(Set<T> value)
+    {
+        return value.size();
+    }
+
+    public void validateForNativeProtocol(ByteBuffer bytes, int version)
     {
         try
         {
             ByteBuffer input = bytes.duplicate();
-            int n = getUnsignedShort(input);
+            int n = readCollectionSize(input, version);
+            for (int i = 0; i < n; i++)
+                elements.validate(readValue(input, version));
+            if (input.hasRemaining())
+                throw new MarshalException("Unexpected extraneous bytes after set value");
+        }
+        catch (BufferUnderflowException e)
+        {
+            throw new MarshalException("Not enough bytes to read a set");
+        }
+    }
+
+    public Set<T> deserializeForNativeProtocol(ByteBuffer bytes, int version)
+    {
+        try
+        {
+            ByteBuffer input = bytes.duplicate();
+            int n = readCollectionSize(input, version);
             Set<T> l = new LinkedHashSet<T>(n);
             for (int i = 0; i < n; i++)
             {
-                int s = getUnsignedShort(input);
-                byte[] data = new byte[s];
-                input.get(data);
-                ByteBuffer databb = ByteBuffer.wrap(data);
+                ByteBuffer databb = readValue(input, version);
                 elements.validate(databb);
                 l.add(elements.deserialize(databb));
             }
+            if (input.hasRemaining())
+                throw new MarshalException("Unexpected extraneous bytes after set value");
             return l;
         }
         catch (BufferUnderflowException e)
         {
-            throw new MarshalException("Not enough bytes to read a list");
+            throw new MarshalException("Not enough bytes to read a set");
         }
-    }
-
-    /**
-     * Layout is: {@code <n><s_1><b_1>...<s_n><b_n> }
-     * where:
-     *   n is the number of elements
-     *   s_i is the number of bytes composing the ith element
-     *   b_i is the s_i bytes composing the ith element
-     */
-    public ByteBuffer serialize(Set<T> value)
-    {
-        List<ByteBuffer> bbs = new ArrayList<ByteBuffer>(value.size());
-        int size = 0;
-        for (T elt : value)
-        {
-            ByteBuffer bb = elements.serialize(elt);
-            bbs.add(bb);
-            size += 2 + bb.remaining();
-        }
-        return pack(bbs, value.size(), size);
     }
 
     public String toString(Set<T> value)
     {
         StringBuilder sb = new StringBuilder();
+        sb.append('{');
         boolean isFirst = true;
         for (T element : value)
         {
@@ -101,10 +114,11 @@ public class SetSerializer<T> extends CollectionSerializer<Set<T>>
             }
             else
             {
-                sb.append("; ");
+                sb.append(", ");
             }
             sb.append(elements.toString(element));
         }
+        sb.append('}');
         return sb.toString();
     }
 

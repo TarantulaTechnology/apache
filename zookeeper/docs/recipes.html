@@ -149,6 +149,9 @@ document.write("Last Published: " + document.lastModified);
 <div class="menuitem">
 <a href="zookeeperObservers.html">Observers Guide</a>
 </div>
+<div class="menuitem">
+<a href="zookeeperReconfig.html">Dynamic Reconfiguration</a>
+</div>
 </div>
 <div onclick="SwitchMenu('menu_1.4', 'skin/')" id="menu_1.4Title" class="menutitle">Contributor</div>
 <div id="menu_1.4" class="menuitemgroup">
@@ -227,7 +230,7 @@ document.write("Last Published: " + document.lastModified);
 <a href="#Shared+Locks">Shared Locks</a>
 </li>
 <li>
-<a href="#sc_recoverableSharedLocks">Recoverable Shared Locks</a>
+<a href="#sc_revocableSharedLocks">Revocable Shared Locks</a>
 </li>
 </ul>
 </li>
@@ -456,7 +459,7 @@ document.write("Last Published: " + document.lastModified);
 <li>
                     
 <p>if <em>p</em> is the lowest process
-                      node in L, wait on highest process node in P</p>
+                      node in L, wait on highest process node in L</p>
                   
 </li>
 
@@ -830,8 +833,8 @@ document.write("Last Published: " + document.lastModified);
 </li>
     
 </ul>
-<a name="sc_recoverableSharedLocks"></a>
-<h4>Recoverable Shared Locks</h4>
+<a name="sc_revocableSharedLocks"></a>
+<h4>Revocable Shared Locks</h4>
 <p>With minor modifications to the Shared Lock protocol, you make
       shared locks revocable by modifying the shared lock protocol:</p>
 <p>In step <strong>1</strong>, of both obtain reader
@@ -891,7 +894,7 @@ document.write("Last Published: " + document.lastModified);
     znodes that represent "proposals" of clients. The idea is to have a znode,
     say "/election", such that each znode creates a child znode "/election/guid-n_"
     with both flags SEQUENCE|EPHEMERAL. With the sequence flag, ZooKeeper
-    automatically appends a sequence number that is greater that any one
+    automatically appends a sequence number that is greater than any one
     previously appended to a child of "/election". The process that created
     the znode with the smallest appended sequence number is the leader.
     </p>

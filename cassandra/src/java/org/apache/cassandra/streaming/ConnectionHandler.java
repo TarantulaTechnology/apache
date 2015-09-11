@@ -17,10 +17,11 @@
  */
 package org.apache.cassandra.streaming;
 
+import java.io.BufferedOutputStream;
 import java.io.IOException;
-import java.net.InetAddress;
 import java.net.Socket;
 import java.net.SocketException;
+import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.WritableByteChannel;
@@ -33,14 +34,16 @@ import java.util.concurrent.atomic.AtomicReference;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.net.OutboundTcpConnectionPool;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
+import org.apache.cassandra.io.util.BufferedDataOutputStreamPlus;
+import org.apache.cassandra.io.util.WrappedDataOutputStreamPlus;
 import org.apache.cassandra.streaming.messages.StreamInitMessage;
 import org.apache.cassandra.streaming.messages.StreamMessage;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 
 /**
  * ConnectionHandler manages incoming/outgoing message exchange for the {@link StreamSession}.
@@ -54,8 +57,6 @@ public class ConnectionHandler
 {
     private static final Logger logger = LoggerFactory.getLogger(ConnectionHandler.class);
 
-    private static final int MAX_CONNECT_ATTEMPTS = 3;
-
     private final StreamSession session;
 
     private IncomingMessageHandler incoming;
@@ -64,6 +65,8 @@ public class ConnectionHandler
     ConnectionHandler(StreamSession session)
     {
         this.session = session;
+        this.incoming = new IncomingMessageHandler(session);
+        this.outgoing = new OutgoingMessageHandler(session);
     }
 
     /**
@@ -73,19 +76,18 @@ public class ConnectionHandler
      *
      * @throws IOException
      */
+    @SuppressWarnings("resource")
     public void initiate() throws IOException
     {
         logger.debug("[Stream #{}] Sending stream init for incoming stream", session.planId());
-        Socket incomingSocket = connect(session.peer);
-        incoming = new IncomingMessageHandler(session, incomingSocket, StreamMessage.CURRENT_VERSION);
-        incoming.sendInitMessage(true);
-        incoming.start();
+        Socket incomingSocket = session.createConnection();
+        incoming.start(incomingSocket, StreamMessage.CURRENT_VERSION);
+        incoming.sendInitMessage(incomingSocket, true);
 
         logger.debug("[Stream #{}] Sending stream init for outgoing stream", session.planId());
-        Socket outgoingSocket = connect(session.peer);
-        outgoing = new OutgoingMessageHandler(session, outgoingSocket, StreamMessage.CURRENT_VERSION);
-        outgoing.sendInitMessage(false);
-        outgoing.start();
+        Socket outgoingSocket = session.createConnection();
+        outgoing.start(outgoingSocket, StreamMessage.CURRENT_VERSION);
+        outgoing.sendInitMessage(outgoingSocket, false);
     }
 
     /**
@@ -98,54 +100,9 @@ public class ConnectionHandler
     public void initiateOnReceivingSide(Socket socket, boolean isForOutgoing, int version) throws IOException
     {
         if (isForOutgoing)
-        {
-            outgoing = new OutgoingMessageHandler(session, socket, version);
-            outgoing.start();
-        }
+            outgoing.start(socket, version);
         else
-        {
-            incoming = new IncomingMessageHandler(session, socket, version);
-            incoming.start();
-        }
-    }
-
-    /**
-     * Connect to peer and start exchanging message.
-     * When connect attempt fails, this retries for maximum of MAX_CONNECT_ATTEMPTS times.
-     *
-     * @param peer the peer to connect to.
-     * @return the created socket.
-     *
-     * @throws IOException when connection failed.
-     */
-    private static Socket connect(InetAddress peer) throws IOException
-    {
-        int attempts = 0;
-        while (true)
-        {
-            try
-            {
-                Socket socket = OutboundTcpConnectionPool.newSocket(peer);
-                socket.setSoTimeout(DatabaseDescriptor.getStreamingSocketTimeout());
-                return socket;
-            }
-            catch (IOException e)
-            {
-                if (++attempts >= MAX_CONNECT_ATTEMPTS)
-                    throw e;
-
-                long waitms = DatabaseDescriptor.getRpcTimeout() * (long)Math.pow(2, attempts);
-                logger.warn("Failed attempt " + attempts + " to connect to " + peer + ". Retrying in " + waitms + " ms. (" + e + ")");
-                try
-                {
-                    Thread.sleep(waitms);
-                }
-                catch (InterruptedException wtf)
-                {
-                    throw new IOException("interrupted", wtf);
-                }
-            }
-        }
+            incoming.start(socket, version);
     }
 
     public ListenableFuture<?> close()
@@ -189,30 +146,29 @@ public class ConnectionHandler
     {
         protected final StreamSession session;
 
-        protected final Socket socket;
-        protected final int protocolVersion;
+        protected int protocolVersion;
+        protected Socket socket;
 
         private final AtomicReference<SettableFuture<?>> closeFuture = new AtomicReference<>();
 
-        protected MessageHandler(StreamSession session, Socket socket, int protocolVersion)
+        protected MessageHandler(StreamSession session)
         {
             this.session = session;
-            this.socket = socket;
-            this.protocolVersion = protocolVersion;
         }
 
         protected abstract String name();
 
-        protected WritableByteChannel getWriteChannel() throws IOException
+        @SuppressWarnings("resource")
+        protected static DataOutputStreamPlus getWriteChannel(Socket socket) throws IOException
         {
             WritableByteChannel out = socket.getChannel();
             // socket channel is null when encrypted(SSL)
-            return out == null
-                 ? Channels.newChannel(socket.getOutputStream())
-                 : out;
+            if (out == null)
+                return new WrappedDataOutputStreamPlus(new BufferedOutputStream(socket.getOutputStream()));
+            return new BufferedDataOutputStreamPlus(out);
         }
 
-        protected ReadableByteChannel getReadChannel() throws IOException
+        protected static ReadableByteChannel getReadChannel(Socket socket) throws IOException
         {
             ReadableByteChannel in = socket.getChannel();
             // socket channel is null when encrypted(SSL)
@@ -221,14 +177,28 @@ public class ConnectionHandler
                  : in;
         }
 
-        public void sendInitMessage(boolean isForOutgoing) throws IOException
+        @SuppressWarnings("resource")
+        public void sendInitMessage(Socket socket, boolean isForOutgoing) throws IOException
         {
-            StreamInitMessage message = new StreamInitMessage(FBUtilities.getBroadcastAddress(), session.planId(), session.description(), isForOutgoing);
-            getWriteChannel().write(message.createMessage(false, protocolVersion));
+            StreamInitMessage message = new StreamInitMessage(
+                    FBUtilities.getBroadcastAddress(),
+                    session.sessionIndex(),
+                    session.planId(),
+                    session.description(),
+                    isForOutgoing,
+                    session.keepSSTableLevel(),
+                    session.isIncremental());
+            ByteBuffer messageBuf = message.createMessage(false, protocolVersion);
+            DataOutputStreamPlus out = getWriteChannel(socket);
+            out.write(messageBuf);
+            out.flush();
         }
 
-        public void start()
+        public void start(Socket socket, int protocolVersion)
         {
+            this.socket = socket;
+            this.protocolVersion = protocolVersion;
+
             new Thread(this, name() + "-" + session.peer).start();
         }
 
@@ -255,7 +225,12 @@ public class ConnectionHandler
             {
                 socket.close();
             }
-            catch (IOException ignore) {}
+            catch (IOException e)
+            {
+                // Erroring out while closing shouldn't happen but is not really a big deal, so just log
+                // it at DEBUG and ignore otherwise.
+                logger.debug("Unexpected error while closing streaming connection", e);
+            }
         }
     }
 
@@ -264,12 +239,9 @@ public class ConnectionHandler
      */
     static class IncomingMessageHandler extends MessageHandler
     {
-        private final ReadableByteChannel in;
-
-        IncomingMessageHandler(StreamSession session, Socket socket, int protocolVersion) throws IOException
+        IncomingMessageHandler(StreamSession session)
         {
-            super(session, socket, protocolVersion);
-            this.in = getReadChannel();
+            super(session);
         }
 
         protected String name()
@@ -277,11 +249,13 @@ public class ConnectionHandler
             return "STREAM-IN";
         }
 
+        @SuppressWarnings("resource")
         public void run()
         {
-            while (!isClosed())
+            try
             {
-                try
+                ReadableByteChannel in = getReadChannel(socket);
+                while (!isClosed())
                 {
                     // receive message
                     StreamMessage message = StreamMessage.deserialize(in, protocolVersion, session);
@@ -293,17 +267,21 @@ public class ConnectionHandler
                         session.messageReceived(message);
                     }
                 }
-                catch (SocketException e)
-                {
-                    // socket is closed
-                    close();
-                }
-                catch (Throwable e)
-                {
-                    session.onError(e);
-                }
             }
-            signalCloseDone();
+            catch (SocketException e)
+            {
+                // socket is closed
+                close();
+            }
+            catch (Throwable t)
+            {
+                JVMStabilityInspector.inspectThrowable(t);
+                session.onError(t);
+            }
+            finally
+            {
+                signalCloseDone();
+            }
         }
     }
 
@@ -326,12 +304,9 @@ public class ConnectionHandler
             }
         });
 
-        private final WritableByteChannel out;
-
-        OutgoingMessageHandler(StreamSession session, Socket socket, int protocolVersion) throws IOException
+        OutgoingMessageHandler(StreamSession session)
         {
-            super(session, socket, protocolVersion);
-            this.out = getWriteChannel();
+            super(session);
         }
 
         protected String name()
@@ -344,32 +319,36 @@ public class ConnectionHandler
             messageQueue.put(message);
         }
 
+        @SuppressWarnings("resource")
         public void run()
         {
-            StreamMessage next;
-            while (!isClosed())
+            try
             {
-                try
+                DataOutputStreamPlus out = getWriteChannel(socket);
+
+                StreamMessage next;
+                while (!isClosed())
                 {
                     if ((next = messageQueue.poll(1, TimeUnit.SECONDS)) != null)
                     {
                         logger.debug("[Stream #{}] Sending {}", session.planId(), next);
-                        sendMessage(next);
+                        sendMessage(out, next);
                         if (next.type == StreamMessage.Type.SESSION_FAILED)
                             close();
                     }
                 }
-                catch (InterruptedException e)
-                {
-                    throw new AssertionError(e);
-                }
-            }
 
-            try
-            {
                 // Sends the last messages on the queue
                 while ((next = messageQueue.poll()) != null)
-                    sendMessage(next);
+                    sendMessage(out, next);
+            }
+            catch (InterruptedException e)
+            {
+                throw new AssertionError(e);
+            }
+            catch (Throwable e)
+            {
+                session.onError(e);
             }
             finally
             {
@@ -377,11 +356,12 @@ public class ConnectionHandler
             }
         }
 
-        private void sendMessage(StreamMessage message)
+        private void sendMessage(DataOutputStreamPlus out, StreamMessage message)
         {
             try
             {
                 StreamMessage.serialize(message, out, protocolVersion, session);
+                out.flush();
             }
             catch (SocketException e)
             {

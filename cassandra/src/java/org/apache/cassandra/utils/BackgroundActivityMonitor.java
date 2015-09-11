@@ -52,11 +52,11 @@ public class BackgroundActivityMonitor
     public static final int IRQ_INDEX = 5;
     public static final int SOFTIRQ_INDEX = 6;
 
-    private static final String OPERATING_SYSTEM = System.getProperty("os.name").toLowerCase();
     private static final int NUM_CPUS = Runtime.getRuntime().availableProcessors();
     private static final String PROC_STAT_PATH = "/proc/stat";
 
     private final AtomicDouble compaction_severity = new AtomicDouble();
+    private final AtomicDouble manual_severity = new AtomicDouble();
     private final ScheduledExecutorService reportThread = new DebuggableScheduledThreadPoolExecutor("Background_Reporter");
 
     private RandomAccessFile statsFile;
@@ -71,16 +71,11 @@ public class BackgroundActivityMonitor
         }
         catch (IOException ex)
         {
-            if (isUnix())
+            if (FBUtilities.hasProcFS())
                 logger.warn("Couldn't open /proc/stats");
             statsFile = null;
         }
         reportThread.scheduleAtFixedRate(new BackgroundActivityReporter(), 1, 1, TimeUnit.SECONDS);
-    }
-
-    public static boolean isUnix()
-    {
-        return OPERATING_SYSTEM.contains("nix") || OPERATING_SYSTEM.contains("nux") || OPERATING_SYSTEM.contains("aix");
     }
 
     private long[] readAndCompute() throws IOException
@@ -90,7 +85,7 @@ public class BackgroundActivityMonitor
         String name = tokenizer.nextToken();
         assert name.equalsIgnoreCase("cpu");
         long[] returned = new long[tokenizer.countTokens()];
-        for (int i = 0; i < tokenizer.countTokens(); i++)
+        for (int i = 0; i < returned.length; i++)
             returned[i] = Long.parseLong(tokenizer.nextToken());
         return returned;
     }
@@ -116,6 +111,11 @@ public class BackgroundActivityMonitor
     public void incrCompactionSeverity(double sev)
     {
         compaction_severity.addAndGet(sev);
+    }
+
+    public void incrManualSeverity(double sev)
+    {
+        manual_severity.addAndGet(sev);
     }
 
     public double getIOWait() throws IOException
@@ -155,7 +155,7 @@ public class BackgroundActivityMonitor
             catch (IOException e)
             {
                 // ignore;
-                if (isUnix())
+                if (FBUtilities.hasProcFS())
                     logger.warn("Couldn't read /proc/stats");
             }
             if (report == -1d)
@@ -163,6 +163,7 @@ public class BackgroundActivityMonitor
 
             if (!Gossiper.instance.isEnabled())
                 return;
+            report += manual_severity.get(); // add manual severity setting.
             VersionedValue updated = StorageService.instance.valueFactory.severity(report);
             Gossiper.instance.addLocalApplicationState(ApplicationState.SEVERITY, updated);
         }

@@ -18,39 +18,40 @@
 */
 package org.apache.cassandra.db;
 
-import static org.junit.Assert.assertEquals;
 import java.io.IOException;
 import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
-import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.Util;
-import org.apache.cassandra.db.filter.IDiskAtomFilter;
-import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.db.columniterator.IdentityQueryFilter;
-import org.apache.cassandra.db.compaction.CompactionManager;
-import org.apache.cassandra.db.index.SecondaryIndex;
-import org.apache.cassandra.dht.BytesToken;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.locator.TokenMetadata;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.CounterId;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
-public class CleanupTest extends SchemaLoader
+import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.Util;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.dht.ByteOrderedPartitioner.BytesToken;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+import static org.junit.Assert.assertEquals;
+
+public class CleanupTest
 {
     public static final int LOOPS = 200;
-    public static final String KEYSPACE1 = "Keyspace1";
-    public static final String CF1 = "Indexed1";
-    public static final String CF2 = "Standard1";
+    public static final String KEYSPACE1 = "CleanupTest1";
+    public static final String CF_INDEXED1 = "Indexed1";
+    public static final String CF_STANDARD1 = "Standard1";
     public static final ByteBuffer COLUMN = ByteBufferUtil.bytes("birthdate");
     public static final ByteBuffer VALUE = ByteBuffer.allocate(8);
     static
@@ -59,62 +60,70 @@ public class CleanupTest extends SchemaLoader
         VALUE.flip();
     }
 
-    @Test
-    public void testCleanup() throws IOException, ExecutionException, InterruptedException, ConfigurationException
+    @BeforeClass
+    public static void defineSchema() throws ConfigurationException
     {
-        StorageService.instance.initServer(0);
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE1,
+                                    KeyspaceParams.simple(1),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1),
+                                    SchemaLoader.compositeIndexCFMD(KEYSPACE1, CF_INDEXED1, true));
+    }
+
+    /*
+    @Test
+    public void testCleanup() throws ExecutionException, InterruptedException
+    {
+        StorageService.instance.getTokenMetadata().clearUnsafe();
 
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF2);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
 
-        List<Row> rows;
+        UnfilteredPartitionIterator iter;
 
         // insert data and verify we get it back w/ range query
-        fillCF(cfs, LOOPS);
+        fillCF(cfs, "val", LOOPS);
 
         // record max timestamps of the sstables pre-cleanup
         List<Long> expectedMaxTimestamps = getMaxTimestampList(cfs);
 
-        rows = Util.getRangeSlice(cfs);
-        assertEquals(LOOPS, rows.size());
+        iter = Util.getRangeSlice(cfs);
+        assertEquals(LOOPS, Iterators.size(iter));
 
         // with one token in the ring, owned by the local node, cleanup should be a no-op
-        CompactionManager.instance.performCleanup(cfs, new CounterId.OneShotRenewer());
+        CompactionManager.instance.performCleanup(cfs);
 
         // ensure max timestamp of the sstables are retained post-cleanup
         assert expectedMaxTimestamps.equals(getMaxTimestampList(cfs));
 
         // check data is still there
-        rows = Util.getRangeSlice(cfs);
-        assertEquals(LOOPS, rows.size());
+        iter = Util.getRangeSlice(cfs);
+        assertEquals(LOOPS, Iterators.size(iter));
     }
+    */
 
     @Test
     public void testCleanupWithIndexes() throws IOException, ExecutionException, InterruptedException
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_INDEXED1);
 
-        List<Row> rows;
 
         // insert data and verify we get it back w/ range query
-        fillCF(cfs, LOOPS);
-        rows = Util.getRangeSlice(cfs);
-        assertEquals(LOOPS, rows.size());
+        fillCF(cfs, "birthdate", LOOPS);
+        assertEquals(LOOPS, Util.getAll(Util.cmd(cfs).build()).size());
 
-        SecondaryIndex index = cfs.indexManager.getIndexForColumn(COLUMN);
+        ColumnDefinition cdef = cfs.metadata.getColumnDefinition(COLUMN);
+        String indexName = cfs.metadata.getIndexes()
+                                       .get(cdef)
+                                       .iterator().next().name;
         long start = System.nanoTime();
-        while (!index.isIndexBuilt(COLUMN) && System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10))
+        while (!cfs.getBuiltIndexes().contains(indexName) && System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10))
             Thread.sleep(10);
 
-        // verify we get it back w/ index query too
-        IndexExpression expr = new IndexExpression(COLUMN, IndexExpression.Operator.EQ, VALUE);
-        List<IndexExpression> clause = Arrays.asList(expr);
-        IDiskAtomFilter filter = new IdentityQueryFilter();
-        IPartitioner p = StorageService.getPartitioner();
-        Range<RowPosition> range = Util.range("", "");
-        rows = keyspace.getColumnFamilyStore(CF1).search(range, clause, filter, Integer.MAX_VALUE);
-        assertEquals(LOOPS, rows.size());
+        RowFilter cf = RowFilter.create();
+        cf.add(cdef, Operator.EQ, VALUE);
+        assertEquals(LOOPS, Util.getAll(Util.cmd(cfs).filterOn("birthdate", Operator.EQ, VALUE).build()).size());
 
         // we don't allow cleanup when the local host has no range to avoid wipping up all data when a node has not join the ring.
         // So to make sure cleanup erase everything here, we give the localhost the tiniest possible range.
@@ -125,21 +134,43 @@ public class CleanupTest extends SchemaLoader
         tmd.updateNormalToken(new BytesToken(tk1), InetAddress.getByName("127.0.0.1"));
         tmd.updateNormalToken(new BytesToken(tk2), InetAddress.getByName("127.0.0.2"));
 
-        CompactionManager.instance.performCleanup(cfs, new CounterId.OneShotRenewer());
+        CompactionManager.instance.performCleanup(cfs);
 
         // row data should be gone
-        rows = Util.getRangeSlice(cfs);
-        assertEquals(0, rows.size());
+        assertEquals(0, Util.getAll(Util.cmd(cfs).build()).size());
 
         // not only should it be gone but there should be no data on disk, not even tombstones
-        assert cfs.getSSTables().isEmpty();
+        assert cfs.getLiveSSTables().isEmpty();
 
         // 2ary indexes should result in no results, too (although tombstones won't be gone until compacted)
-        rows = cfs.search(range, clause, filter, Integer.MAX_VALUE);
-        assertEquals(0, rows.size());
+        assertEquals(0, Util.getAll(Util.cmd(cfs).filterOn("birthdate", Operator.EQ, VALUE).build()).size());
     }
 
-    protected void fillCF(ColumnFamilyStore cfs, int rowsPerSSTable) throws ExecutionException, InterruptedException, IOException
+    @Test
+    public void testCleanupWithNewToken() throws ExecutionException, InterruptedException, UnknownHostException
+    {
+        StorageService.instance.getTokenMetadata().clearUnsafe();
+
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+
+        // insert data and verify we get it back w/ range query
+        fillCF(cfs, "val", LOOPS);
+
+        assertEquals(LOOPS, Util.getAll(Util.cmd(cfs).build()).size());
+        TokenMetadata tmd = StorageService.instance.getTokenMetadata();
+
+        byte[] tk1 = new byte[1], tk2 = new byte[1];
+        tk1[0] = 2;
+        tk2[0] = 1;
+        tmd.updateNormalToken(new BytesToken(tk1), InetAddress.getByName("127.0.0.1"));
+        tmd.updateNormalToken(new BytesToken(tk2), InetAddress.getByName("127.0.0.2"));
+        CompactionManager.instance.performCleanup(cfs);
+
+        assertEquals(0, Util.getAll(Util.cmd(cfs).build()).size());
+    }
+
+    protected void fillCF(ColumnFamilyStore cfs, String colName, int rowsPerSSTable)
     {
         CompactionManager.instance.disableAutoCompaction();
 
@@ -147,10 +178,11 @@ public class CleanupTest extends SchemaLoader
         {
             String key = String.valueOf(i);
             // create a row and update the birthdate value, test that the index query fetches the new version
-            RowMutation rm;
-            rm = new RowMutation(KEYSPACE1, ByteBufferUtil.bytes(key));
-            rm.add(cfs.name, COLUMN, VALUE, System.currentTimeMillis());
-            rm.applyUnsafe();
+            new RowUpdateBuilder(cfs.metadata, System.currentTimeMillis(), ByteBufferUtil.bytes(key))
+                    .clustering(COLUMN)
+                    .add(colName, VALUE)
+                    .build()
+                    .applyUnsafe();
         }
 
         cfs.forceBlockingFlush();
@@ -159,7 +191,7 @@ public class CleanupTest extends SchemaLoader
     protected List<Long> getMaxTimestampList(ColumnFamilyStore cfs)
     {
         List<Long> list = new LinkedList<Long>();
-        for (SSTableReader sstable : cfs.getSSTables())
+        for (SSTableReader sstable : cfs.getLiveSSTables())
             list.add(sstable.getMaxTimestamp());
         return list;
     }

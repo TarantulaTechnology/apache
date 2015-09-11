@@ -20,7 +20,7 @@ package org.apache.cassandra.metrics;
 import java.net.InetAddress;
 import java.util.Map.Entry;
 
-import org.apache.cassandra.db.HintedHandOffManager;
+import com.codahale.metrics.Counter;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.utils.UUIDGen;
 import org.slf4j.Logger;
@@ -29,19 +29,17 @@ import org.slf4j.LoggerFactory;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
-import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Counter;
-import com.yammer.metrics.core.MetricName;
+
+import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
 /**
- * Metrics for {@link HintedHandOffManager}.
+ * Metrics for {@link org.apache.cassandra.hints.HintsService}.
  */
 public class HintedHandoffMetrics
 {
     private static final Logger logger = LoggerFactory.getLogger(HintedHandoffMetrics.class);
 
-    public static final String GROUP_NAME = "org.apache.cassandra.metrics";
-    public static final String TYPE_NAME = "HintedHandOffManager";
+    private static final MetricNameFactory factory = new DefaultNameFactory("HintedHandOffManager");
 
     /** Total number of hints which are not stored, This is not a cache. */
     private final LoadingCache<InetAddress, DifferencingCounter> notStored = CacheBuilder.newBuilder().build(new CacheLoader<InetAddress, DifferencingCounter>()
@@ -57,7 +55,7 @@ public class HintedHandoffMetrics
     {
         public Counter load(InetAddress address)
         {
-            return Metrics.newCounter(new MetricName(GROUP_NAME, TYPE_NAME, "Hints_created-" + address.getHostAddress()));
+            return Metrics.counter(factory.createMetricName("Hints_created-" + address.getHostAddress().replace(':', '.')));
         }
     });
 
@@ -83,19 +81,19 @@ public class HintedHandoffMetrics
         }
     }
 
-    public class DifferencingCounter
+    public static class DifferencingCounter
     {
         private final Counter meter;
         private long reported = 0;
 
         public DifferencingCounter(InetAddress address)
         {
-            this.meter = Metrics.newCounter(new MetricName(GROUP_NAME, TYPE_NAME, "Hints_not_stored-" + address.getHostAddress()));
+            this.meter = Metrics.counter(factory.createMetricName("Hints_not_stored-" + address.getHostAddress().replace(':', '.')));
         }
 
         public long difference()
         {
-            long current = meter.count();
+            long current = meter.getCount();
             long difference = current - reported;
             this.reported = current;
             return difference;
@@ -103,7 +101,7 @@ public class HintedHandoffMetrics
 
         public long count()
         {
-            return meter.count();
+            return meter.getCount();
         }
 
         public void mark()

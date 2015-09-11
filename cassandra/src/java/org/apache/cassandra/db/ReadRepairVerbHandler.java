@@ -21,13 +21,11 @@ import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessagingService;
 
-public class ReadRepairVerbHandler implements IVerbHandler<RowMutation>
+public class ReadRepairVerbHandler implements IVerbHandler<Mutation>
 {
-    public void doVerb(MessageIn<RowMutation> message, int id)
+    public void doVerb(MessageIn<Mutation> message, int id)
     {
-        RowMutation rm = message.payload;
-        rm.apply();
-        WriteResponse response = new WriteResponse();
-        MessagingService.instance().sendReply(response.createMessage(), id, message.from);
+        message.payload.apply();
+        MessagingService.instance().sendReply(WriteResponse.createMessage(), id, message.from);
     }
 }

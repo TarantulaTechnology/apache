@@ -30,6 +30,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 
 import org.apache.jute.BinaryOutputArchive;
+import org.apache.zookeeper.ZKTestCase;
 import org.apache.zookeeper.data.Id;
 import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.ZooDefs.OpCode;
@@ -69,7 +70,7 @@ import org.slf4j.LoggerFactory;
  * 3. The pipeline needs to be drained before a write request can enter.
  * 4. No in-flight write requests while processing a read request.
  */
-public class CommitProcessorTest {
+public class CommitProcessorTest extends ZKTestCase {
     protected static final Logger LOG =
         LoggerFactory.getLogger(CommitProcessorTest.class);
 
@@ -87,6 +88,7 @@ public class CommitProcessorTest {
         System.setProperty(
             CommitProcessor.ZOOKEEPER_COMMIT_PROC_NUM_WORKER_THREADS,
             Integer.toString(numCommitThreads));
+        System.setProperty("zookeeper.admin.enableServer", "false");
         tmpDir = ClientBase.createTmpDir();
         ClientBase.setupTestEnv();
         zks = new TestZooKeeperServer(tmpDir, tmpDir, 4000);
@@ -232,7 +234,8 @@ public class CommitProcessorTest {
             // processor, so it can do pre/post validating of requests
             ValidateProcessor validateProcessor =
                 new ValidateProcessor(finalProcessor);
-            commitProcessor = new CommitProcessor(validateProcessor, "1", true);
+            commitProcessor = new CommitProcessor(validateProcessor, "1", true,
+                    getZooKeeperServerListener());
             validateProcessor.setCommitProcessor(commitProcessor);
             commitProcessor.start();
             MockProposalRequestProcessor proposalProcessor =

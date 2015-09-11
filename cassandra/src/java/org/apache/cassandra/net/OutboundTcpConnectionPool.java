@@ -22,6 +22,8 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.channels.SocketChannel;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.config.Config;
@@ -34,25 +36,29 @@ import org.apache.cassandra.utils.FBUtilities;
 
 public class OutboundTcpConnectionPool
 {
+    public static final long LARGE_MESSAGE_THRESHOLD =
+            Long.getLong(Config.PROPERTY_PREFIX + "otcp_large_message_threshold", 1024 * 64);
+
     // pointer for the real Address.
     private final InetAddress id;
-    public final OutboundTcpConnection cmdCon;
-    public final OutboundTcpConnection ackCon;
-    // pointer to the reseted Address.
-    private InetAddress resetedEndpoint;
+    private final CountDownLatch started;
+    public final OutboundTcpConnection smallMessages;
+    public final OutboundTcpConnection largeMessages;
+    public final OutboundTcpConnection gossipMessages;
+
+    // pointer to the reset Address.
+    private InetAddress resetEndpoint;
     private ConnectionMetrics metrics;
 
     OutboundTcpConnectionPool(InetAddress remoteEp)
     {
         id = remoteEp;
-        resetedEndpoint = SystemKeyspace.getPreferredIP(remoteEp);
+        resetEndpoint = SystemKeyspace.getPreferredIP(remoteEp);
+        started = new CountDownLatch(1);
 
-        cmdCon = new OutboundTcpConnection(this);
-        cmdCon.start();
-        ackCon = new OutboundTcpConnection(this);
-        ackCon.start();
-
-        metrics = new ConnectionMetrics(id, this);
+        smallMessages = new OutboundTcpConnection(this);
+        largeMessages = new OutboundTcpConnection(this);
+        gossipMessages = new OutboundTcpConnection(this);
     }
 
     /**
@@ -61,21 +67,22 @@ public class OutboundTcpConnectionPool
      */
     OutboundTcpConnection getConnection(MessageOut msg)
     {
-        Stage stage = msg.getStage();
-        return stage == Stage.REQUEST_RESPONSE || stage == Stage.INTERNAL_RESPONSE || stage == Stage.GOSSIP
-               ? ackCon
-               : cmdCon;
+        if (Stage.GOSSIP == msg.getStage())
+            return gossipMessages;
+        return msg.payloadSize(smallMessages.getTargetVersion()) > LARGE_MESSAGE_THRESHOLD
+               ? largeMessages
+               : smallMessages;
     }
 
     void reset()
     {
-        for (OutboundTcpConnection conn : new OutboundTcpConnection[] { cmdCon, ackCon })
+        for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages, gossipMessages })
             conn.closeSocket(false);
     }
 
     public void resetToNewerVersion(int version)
     {
-        for (OutboundTcpConnection conn : new OutboundTcpConnection[] { cmdCon, ackCon })
+        for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages, gossipMessages })
         {
             if (version > conn.getTargetVersion())
                 conn.softCloseSocket();
@@ -90,24 +97,20 @@ public class OutboundTcpConnectionPool
     public void reset(InetAddress remoteEP)
     {
         SystemKeyspace.updatePreferredIP(id, remoteEP);
-        resetedEndpoint = remoteEP;
-        for (OutboundTcpConnection conn : new OutboundTcpConnection[] { cmdCon, ackCon })
+        resetEndpoint = remoteEP;
+        for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages, gossipMessages })
             conn.softCloseSocket();
 
         // release previous metrics and create new one with reset address
         metrics.release();
-        metrics = new ConnectionMetrics(resetedEndpoint, this);
+        metrics = new ConnectionMetrics(resetEndpoint, this);
     }
 
     public long getTimeouts()
     {
-       return metrics.timeouts.count();
+       return metrics.timeouts.getCount();
     }
 
-    public long getRecentTimeouts()
-    {
-        return metrics.getRecentTimeout();
-    }
 
     public void incrementTimeout()
     {
@@ -142,7 +145,7 @@ public class OutboundTcpConnectionPool
     {
         if (id.equals(FBUtilities.getBroadcastAddress()))
             return FBUtilities.getLocalAddress();
-        return resetedEndpoint == null ? id : resetedEndpoint;
+        return resetEndpoint;
     }
 
     public static boolean isEncryptedChannel(InetAddress address)
@@ -168,13 +171,47 @@ public class OutboundTcpConnectionPool
         return true;
     }
 
-   public void close()
+    public void start()
+    {
+        smallMessages.start();
+        largeMessages.start();
+        gossipMessages.start();
+
+        metrics = new ConnectionMetrics(id, this);
+
+        started.countDown();
+    }
+
+    public void waitForStarted()
+    {
+        if (started.getCount() == 0)
+            return;
+
+        boolean error = false;
+        try
+        {
+            if (!started.await(1, TimeUnit.MINUTES))
+                error = true;
+        }
+        catch (InterruptedException e)
+        {
+            Thread.currentThread().interrupt();
+            error = true;
+        }
+        if (error)
+            throw new IllegalStateException(String.format("Connections to %s are not started!", id.getHostAddress()));
+    }
+
+    public void close()
     {
         // these null guards are simply for tests
-        if (ackCon != null)
-            ackCon.closeSocket(true);
-        if (cmdCon != null)
-            cmdCon.closeSocket(true);
+        if (largeMessages != null)
+            largeMessages.closeSocket(true);
+        if (smallMessages != null)
+            smallMessages.closeSocket(true);
+        if (gossipMessages != null)
+            gossipMessages.closeSocket(true);
+
         metrics.release();
     }
 }

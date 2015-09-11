@@ -75,8 +75,8 @@ void waitCounter(){
 }
 
 void listener(zhandle_t *zzh, int type, int state, const char *path,void* ctx) {
-    if(type == ZOO_SESSION_EVENT){
-        if(state == ZOO_CONNECTED_STATE){
+    if (type == ZOO_SESSION_EVENT) {
+        if (state == ZOO_CONNECTED_STATE || state == ZOO_READONLY_STATE) {
             pthread_mutex_lock(&lock);
             pthread_cond_broadcast(&cond);
             pthread_mutex_unlock(&lock);
@@ -106,6 +106,7 @@ int doCreateNodes(const char* root, int count){
         }
         if(rc!=ZOK) return rc;        
     }
+    return ZOK;
 }
 
 int createRoot(const char* root){
@@ -131,6 +132,7 @@ int doWrites(const char* root, int count){
         rc=zoo_aset(zh, nodeName, "second", 6,-1,write_completion, 0);
         if(rc!=ZOK) return rc;        
     }
+    return ZOK;
 }
 
 void read_completion(int rc, const char *value, int value_len,
@@ -159,6 +161,7 @@ int doReads(const char* root, int count){
         rc=zoo_aget(zh, nodeName,0,read_completion, 0);
         if(rc!=ZOK) return rc;        
     }
+    return ZOK;
 }
 
 void delete_completion(int rc, const void *data) {
@@ -176,6 +179,7 @@ int doDeletes(const char* root, int count){
         rc=zoo_adelete(zh, nodeName,-1,delete_completion, 0);
         if(rc!=ZOK) return rc;        
     }
+    return ZOK;
 }
 
 static int free_String_vector(struct String_vector *v) {
@@ -252,7 +256,7 @@ int main(int argc, char **argv) {
         deletedCounter=0;
         rc=recursiveDelete(argv[2]);
         if(rc==ZOK){
-            LOG_INFO(LOGSTREAM, "Succesfully deleted a subtree starting at %s (%d nodes)",
+            LOG_INFO(LOGSTREAM, "Successfully deleted a subtree starting at %s (%d nodes)",
                     argv[2],deletedCounter);
             exit(0);
         }

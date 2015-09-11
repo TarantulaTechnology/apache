@@ -24,6 +24,7 @@ import java.util.List;
 import org.apache.jute.Record;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.ZooDefs.OpCode;
+import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.data.Id;
 import org.apache.zookeeper.server.quorum.flexible.QuorumVerifier;
 import org.apache.zookeeper.txn.TxnHeader;
@@ -75,7 +76,7 @@ public class Request {
 
     public final List<Id> authInfo;
 
-    public final long createTime = System.currentTimeMillis();
+    public final long createTime = Time.currentElapsedTime();
 
     private Object owner;
 
@@ -83,6 +84,19 @@ public class Request {
 
     public QuorumVerifier qv = null;
     
+    /**
+     * If this is a create or close request for a local-only session.
+     */
+    private boolean isLocalSession = false;
+
+    public boolean isLocalSession() {
+        return isLocalSession;
+    }
+
+    public void setLocalSession(boolean isLocalSession) {
+        this.isLocalSession = isLocalSession;
+    }
+
     public Object getOwner() {
         return owner;
     }
@@ -119,50 +133,57 @@ public class Request {
         switch (type) {
         case OpCode.notification:
             return false;
+        case OpCode.check:
+        case OpCode.closeSession:
         case OpCode.create:
         case OpCode.create2:
-        case OpCode.delete:
+        case OpCode.createContainer:
         case OpCode.createSession:
+        case OpCode.delete:
+        case OpCode.deleteContainer:
         case OpCode.exists:
-        case OpCode.getData:
-        case OpCode.check:
-        case OpCode.multi:
-        case OpCode.setData:
-        case OpCode.sync:
         case OpCode.getACL:
-        case OpCode.setACL:
         case OpCode.getChildren:
         case OpCode.getChildren2:
+        case OpCode.getData:
+        case OpCode.multi:
         case OpCode.ping:
-        case OpCode.closeSession:
-        case OpCode.setWatches:
         case OpCode.reconfig:
+        case OpCode.setACL:
+        case OpCode.setData:
+        case OpCode.setWatches:
+        case OpCode.sync:
+        case OpCode.checkWatches:
+        case OpCode.removeWatches:
             return true;
         default:
             return false;
         }
     }
 
-    static boolean isQuorum(int type) {
-        switch (type) {
+    public boolean isQuorum() {
+        switch (this.type) {
         case OpCode.exists:
         case OpCode.getACL:
         case OpCode.getChildren:
         case OpCode.getChildren2:
         case OpCode.getData:
             return false;
-        case OpCode.error:
-        case OpCode.closeSession:
         case OpCode.create:
         case OpCode.create2:
-        case OpCode.createSession:
+        case OpCode.createContainer:
+        case OpCode.error:
         case OpCode.delete:
+        case OpCode.deleteContainer:
         case OpCode.setACL:
         case OpCode.setData:
         case OpCode.check:
         case OpCode.multi:
         case OpCode.reconfig:
             return true;
+        case OpCode.closeSession:
+        case OpCode.createSession:
+            return !this.isLocalSession;
         default:
             return false;
         }
@@ -176,10 +197,14 @@ public class Request {
             return "create";
         case OpCode.create2:
             return "create2";
+        case OpCode.createContainer:
+            return "createContainer";
         case OpCode.setWatches:
             return "setWatches";
         case OpCode.delete:
             return "delete";
+        case OpCode.deleteContainer:
+            return "deleteContainer";
         case OpCode.exists:
             return "exists";
         case OpCode.getData:
@@ -210,6 +235,10 @@ public class Request {
             return "error";
         case OpCode.reconfig:
            return "reconfig";
+        case OpCode.checkWatches:
+            return "checkWatches";
+        case OpCode.removeWatches:
+            return "removeWatches";
         default:
             return "unknown " + op;
         }

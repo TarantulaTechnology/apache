@@ -21,9 +21,12 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
 import java.io.Serializable;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +36,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.pig.PigException;
 import org.apache.pig.impl.util.MultiMap;
+import org.apache.pig.impl.util.Pair;
 
 
 //import org.apache.commons.collections.map.MultiValueMap;
@@ -67,6 +71,7 @@ import org.apache.pig.impl.util.MultiMap;
 // Suppress "unchecked" warnings for all logical plan related classes. Will revisit in logical plan rework
 @SuppressWarnings("unchecked")
 public abstract class OperatorPlan<E extends Operator> implements Iterable<E>, Serializable, Cloneable {
+    private static final long serialVersionUID = 1L;
     protected Map<E, OperatorKey> mOps;
     protected Map<OperatorKey, E> mKeys;
     protected MultiMap<E, E> mFromEdges;

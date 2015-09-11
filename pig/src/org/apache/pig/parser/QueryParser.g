@@ -224,6 +224,7 @@ statement : SEMI_COLON!
           | import_clause SEMI_COLON!
           | realias_clause SEMI_COLON!
           | register_clause SEMI_COLON!
+          | assert_clause SEMI_COLON!
           // semicolons after foreach_complex_statement are optional for backwards compatibility, but to keep
           // the grammar unambiguous if there is one then we'll parse it as a single, standalone semicolon
           // (which matches the first statement rule)
@@ -328,7 +329,7 @@ explicit_bag_type : BAG! implicit_bag_type
 explicit_bag_type_cast : BAG LEFT_CURLY explicit_tuple_type_cast? RIGHT_CURLY -> ^( BAG_TYPE_CAST explicit_tuple_type_cast? )
 ;
 
-implicit_map_type : LEFT_BRACKET type? RIGHT_BRACKET -> ^( MAP_TYPE type? )
+implicit_map_type : LEFT_BRACKET ( ( identifier_plus COLON )? type )? RIGHT_BRACKET -> ^( MAP_TYPE identifier_plus? type? )
 ;
 
 explicit_map_type : MAP! implicit_map_type
@@ -475,6 +476,9 @@ previous_rel : ARROBA
 ;
 
 store_clause : STORE^ rel INTO! QUOTEDSTRING ( USING! func_clause )?
+;
+
+assert_clause : ASSERT^ rel BY! cond ( COMMA! QUOTEDSTRING )?
 ;
 
 filter_clause : FILTER^ rel BY! cond
@@ -1025,6 +1029,7 @@ eid_without_columns : rel_str_op
     | FULL
     | REALIAS
     | BOOL_COND
+    | ASSERT
 ;
 
 eid : eid_without_columns

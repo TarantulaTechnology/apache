@@ -21,9 +21,9 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 
-import org.apache.cassandra.cache.RefCountedMemory;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.util.Memory;
+import org.apache.cassandra.utils.concurrent.Ref;
 
 /**
  * Off-heap bitset,
@@ -42,7 +42,7 @@ public class OffHeapBitSet implements IBitSet
         try
         {
             long byteCount = wordCount * 8L;
-            bytes = RefCountedMemory.allocate(byteCount);
+            bytes = Memory.allocate(byteCount);
         }
         catch (OutOfMemoryError e)
         {
@@ -62,12 +62,23 @@ public class OffHeapBitSet implements IBitSet
         return bytes.size() * 8;
     }
 
+    @Override
+    public long offHeapSize()
+    {
+        return bytes.size();
+    }
+
+    public void addTo(Ref.IdentityCollection identities)
+    {
+        identities.add(bytes);
+    }
+
     public boolean get(long index)
     {
         long i = index >> 3;
         long bit = index & 0x7;
         int bitmask = 0x1 << bit;
-        return ((bytes.getByte(i) & 0xFF) & bitmask) != 0;
+        return (bytes.getByte(i) & bitmask) != 0;
     }
 
     public void set(long index)
@@ -103,7 +114,7 @@ public class OffHeapBitSet implements IBitSet
         out.writeInt((int) (bytes.size() / 8));
         for (long i = 0; i < bytes.size();)
         {
-            long value = ((bytes.getByte(i++) & 0xff) << 0) 
+            long value = ((bytes.getByte(i++) & 0xff) << 0)
                        + ((bytes.getByte(i++) & 0xff) << 8)
                        + ((bytes.getByte(i++) & 0xff) << 16)
                        + ((long) (bytes.getByte(i++) & 0xff) << 24)
@@ -115,15 +126,16 @@ public class OffHeapBitSet implements IBitSet
         }
     }
 
-    public long serializedSize(TypeSizes type)
+    public long serializedSize()
     {
-        return type.sizeof((int) bytes.size()) + bytes.size();
+        return TypeSizes.sizeof((int) bytes.size()) + bytes.size();
     }
 
+    @SuppressWarnings("resource")
     public static OffHeapBitSet deserialize(DataInput in) throws IOException
     {
         long byteCount = in.readInt() * 8L;
-        Memory memory = RefCountedMemory.allocate(byteCount);
+        Memory memory = Memory.allocate(byteCount);
         for (long i = 0; i < byteCount;)
         {
             long v = in.readLong();
@@ -139,7 +151,7 @@ public class OffHeapBitSet implements IBitSet
         return new OffHeapBitSet(memory);
     }
 
-    public void close() throws IOException
+    public void close()
     {
         bytes.free();
     }
@@ -166,5 +178,10 @@ public class OffHeapBitSet implements IBitSet
             h = (h << 1) | (h >>> 63); // rotate left
         }
         return (int) ((h >> 32) ^ h) + 0x98761234;
+    }
+
+    public String toString()
+    {
+        return "[OffHeapBitSet]";
     }
 }

@@ -17,10 +17,11 @@
  */
 package org.apache.cassandra.service;
 
+import java.net.InetAddress;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 
 import org.apache.cassandra.tracing.Tracing;
-import org.apache.cassandra.utils.FBUtilities;
 
 /**
  * Represents the state related to a given query.
@@ -28,12 +29,19 @@ import org.apache.cassandra.utils.FBUtilities;
 public class QueryState
 {
     private final ClientState clientState;
-    private volatile long clock;
     private volatile UUID preparedTracingSession;
 
     public QueryState(ClientState clientState)
     {
         this.clientState = clientState;
+    }
+
+    /**
+     * @return a QueryState object for internal C* calls (not limited by any kind of auth).
+     */
+    public static QueryState forInternalCalls()
+    {
+        return new QueryState(ClientState.forInternalCalls());
     }
 
     public ClientState getClientState()
@@ -47,9 +55,7 @@ public class QueryState
      */
     public long getTimestamp()
     {
-        long current = System.currentTimeMillis() * 1000;
-        clock = clock >= current ? clock + 1 : current;
-        return clock;
+        return clientState.getTimestamp();
     }
 
     public boolean traceNextQuery()
@@ -59,8 +65,8 @@ public class QueryState
             return true;
         }
 
-        double tracingProbability = StorageService.instance.getTracingProbability();
-        return tracingProbability != 0 && FBUtilities.threadLocalRandom().nextDouble() < tracingProbability;
+        double traceProbability = StorageService.instance.getTraceProbability();
+        return traceProbability != 0 && ThreadLocalRandom.current().nextDouble() < traceProbability;
     }
 
     public void prepareTracingSession(UUID sessionId)
@@ -70,15 +76,22 @@ public class QueryState
 
     public void createTracingSession()
     {
-        if (this.preparedTracingSession == null)
+        UUID session = this.preparedTracingSession;
+        if (session == null)
         {
             Tracing.instance.newSession();
         }
         else
         {
-            UUID session = this.preparedTracingSession;
-            this.preparedTracingSession = null;
             Tracing.instance.newSession(session);
+            this.preparedTracingSession = null;
         }
+    }
+
+    public InetAddress getClientAddress()
+    {
+        return clientState.isInternal
+             ? null
+             : clientState.getRemoteAddress().getAddress();
     }
 }

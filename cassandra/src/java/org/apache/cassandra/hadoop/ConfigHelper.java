@@ -1,4 +1,3 @@
-package org.apache.cassandra.hadoop;
 /*
  *
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -19,17 +18,16 @@ package org.apache.cassandra.hadoop;
  * under the License.
  *
  */
+package org.apache.cassandra.hadoop;
 
 import java.io.IOException;
 import java.util.*;
 
-import com.google.common.collect.Maps;
-import org.apache.cassandra.io.compress.CompressionParameters;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.schema.CompressionParams;
 import org.apache.cassandra.thrift.*;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Hex;
@@ -40,7 +38,6 @@ import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.transport.TTransport;
-
 
 public class ConfigHelper
 {
@@ -69,13 +66,10 @@ public class ConfigHelper
     private static final String WRITE_CONSISTENCY_LEVEL = "cassandra.consistencylevel.write";
     private static final String OUTPUT_COMPRESSION_CLASS = "cassandra.output.compression.class";
     private static final String OUTPUT_COMPRESSION_CHUNK_LENGTH = "cassandra.output.compression.length";
-
-    private static final String INPUT_TRANSPORT_FACTORY_CLASS = "cassandra.input.transport.factory.class";
-    private static final String OUTPUT_TRANSPORT_FACTORY_CLASS = "cassandra.output.transport.factory.class";
+    private static final String OUTPUT_LOCAL_DC_ONLY = "cassandra.output.local.dc.only";
     private static final String THRIFT_FRAMED_TRANSPORT_SIZE_IN_MB = "cassandra.thrift.framed.size_mb";
 
     private static final Logger logger = LoggerFactory.getLogger(ConfigHelper.class);
-
 
     /**
      * Set the keyspace and column family for the input of this job.
@@ -88,13 +82,10 @@ public class ConfigHelper
     public static void setInputColumnFamily(Configuration conf, String keyspace, String columnFamily, boolean widerows)
     {
         if (keyspace == null)
-        {
             throw new UnsupportedOperationException("keyspace may not be null");
-        }
+
         if (columnFamily == null)
-        {
-            throw new UnsupportedOperationException("columnfamily may not be null");
-        }
+            throw new UnsupportedOperationException("table may not be null");
 
         conf.set(INPUT_KEYSPACE_CONFIG, keyspace);
         conf.set(INPUT_COLUMNFAMILY_CONFIG, columnFamily);
@@ -122,9 +113,7 @@ public class ConfigHelper
     public static void setOutputKeyspace(Configuration conf, String keyspace)
     {
         if (keyspace == null)
-        {
             throw new UnsupportedOperationException("keyspace may not be null");
-        }
 
         conf.set(OUTPUT_KEYSPACE_CONFIG, keyspace);
     }
@@ -382,7 +371,7 @@ public class ConfigHelper
 
     public static String getReadConsistencyLevel(Configuration conf)
     {
-        return conf.get(READ_CONSISTENCY_LEVEL, "ONE");
+        return conf.get(READ_CONSISTENCY_LEVEL, "LOCAL_ONE");
     }
 
     public static void setReadConsistencyLevel(Configuration conf, String consistencyLevel)
@@ -392,7 +381,7 @@ public class ConfigHelper
 
     public static String getWriteConsistencyLevel(Configuration conf)
     {
-        return conf.get(WRITE_CONSISTENCY_LEVEL, "ONE");
+        return conf.get(WRITE_CONSISTENCY_LEVEL, "LOCAL_ONE");
     }
 
     public static void setWriteConsistencyLevel(Configuration conf, String consistencyLevel)
@@ -427,14 +416,7 @@ public class ConfigHelper
 
     public static IPartitioner getInputPartitioner(Configuration conf)
     {
-        try
-        {
-            return FBUtilities.newPartitioner(conf.get(INPUT_PARTITIONER_CONFIG));
-        }
-        catch (ConfigurationException e)
-        {
-            throw new RuntimeException(e);
-        }
+        return FBUtilities.newPartitioner(conf.get(INPUT_PARTITIONER_CONFIG));
     }
 
     public static int getOutputRpcPort(Configuration conf)
@@ -464,14 +446,7 @@ public class ConfigHelper
 
     public static IPartitioner getOutputPartitioner(Configuration conf)
     {
-        try
-        {
-            return FBUtilities.newPartitioner(conf.get(OUTPUT_PARTITIONER_CONFIG));
-        }
-        catch (ConfigurationException e)
-        {
-            throw new RuntimeException(e);
-        }
+        return FBUtilities.newPartitioner(conf.get(OUTPUT_PARTITIONER_CONFIG));
     }
 
     public static String getOutputCompressionClass(Configuration conf)
@@ -481,7 +456,7 @@ public class ConfigHelper
 
     public static String getOutputCompressionChunkLength(Configuration conf)
     {
-        return conf.get(OUTPUT_COMPRESSION_CHUNK_LENGTH, String.valueOf(CompressionParameters.DEFAULT_CHUNK_LENGTH));
+        return conf.get(OUTPUT_COMPRESSION_CHUNK_LENGTH, String.valueOf(CompressionParams.DEFAULT_CHUNK_LENGTH));
     }
 
     public static void setOutputCompressionClass(Configuration conf, String classname)
@@ -508,20 +483,14 @@ public class ConfigHelper
         return conf.getInt(THRIFT_FRAMED_TRANSPORT_SIZE_IN_MB, 15) * 1024 * 1024; // 15MB is default in Cassandra
     }
 
-    public static CompressionParameters getOutputCompressionParamaters(Configuration conf)
+    public static boolean getOutputLocalDCOnly(Configuration conf)
     {
-        if (getOutputCompressionClass(conf) == null)
-            return new CompressionParameters(null);
+        return Boolean.parseBoolean(conf.get(OUTPUT_LOCAL_DC_ONLY, "false"));
+    }
 
-        Map<String, String> options = new HashMap<String, String>();
-        options.put(CompressionParameters.SSTABLE_COMPRESSION, getOutputCompressionClass(conf));
-        options.put(CompressionParameters.CHUNK_LENGTH_KB, getOutputCompressionChunkLength(conf));
-
-        try {
-            return CompressionParameters.create(options);
-        } catch (ConfigurationException e) {
-            throw new RuntimeException(e);
-        }
+    public static void setOutputLocalDCOnly(Configuration conf, boolean localDCOnly)
+    {
+        conf.set(OUTPUT_LOCAL_DC_ONLY, Boolean.toString(localDCOnly));
     }
 
     public static Cassandra.Client getClientFromInputAddressList(Configuration conf) throws IOException
@@ -562,12 +531,12 @@ public class ConfigHelper
         return client;
     }
 
-    public static Cassandra.Client createConnection(Configuration conf, String host, Integer port)
-            throws IOException
+    @SuppressWarnings("resource")
+    public static Cassandra.Client createConnection(Configuration conf, String host, Integer port) throws IOException
     {
         try
         {
-            TTransport transport = getClientTransportFactory(conf).openTransport(host, port, conf);
+            TTransport transport = getClientTransportFactory(conf).openTransport(host, port);
             return new Cassandra.Client(new TBinaryProtocol(transport, true, true));
         }
         catch (Exception e)
@@ -578,16 +547,15 @@ public class ConfigHelper
 
     public static ITransportFactory getClientTransportFactory(Configuration conf)
     {
-        String factoryClassName = conf.get(
-                ITransportFactory.PROPERTY_KEY,
-                TFramedTransportFactory.class.getName());
+        String factoryClassName = conf.get(ITransportFactory.PROPERTY_KEY, TFramedTransportFactory.class.getName());
         ITransportFactory factory = getClientTransportFactory(factoryClassName);
         Map<String, String> options = getOptions(conf, factory.supportedOptions());
         factory.setOptions(options);
         return factory;
     }
 
-    private static ITransportFactory getClientTransportFactory(String factoryClassName) {
+    private static ITransportFactory getClientTransportFactory(String factoryClassName)
+    {
         try
         {
             return (ITransportFactory) Class.forName(factoryClassName).newInstance();
@@ -597,8 +565,10 @@ public class ConfigHelper
             throw new RuntimeException("Failed to instantiate transport factory:" + factoryClassName, e);
         }
     }
-    private static Map<String, String> getOptions(Configuration conf, Set<String> supportedOptions) {
-        Map<String, String> options = Maps.newHashMap();
+
+    private static Map<String, String> getOptions(Configuration conf, Set<String> supportedOptions)
+    {
+        Map<String, String> options = new HashMap<>();
         for (String optionKey : supportedOptions)
         {
             String optionValue = conf.get(optionKey);

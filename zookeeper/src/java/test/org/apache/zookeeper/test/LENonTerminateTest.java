@@ -37,6 +37,7 @@ import org.apache.zookeeper.PortAssignment;
 import org.apache.zookeeper.ZKTestCase;
 import org.apache.zookeeper.server.ServerCnxnFactory;
 import org.apache.zookeeper.server.quorum.Election;
+import org.apache.zookeeper.server.quorum.FLELostMessageTest;
 import org.apache.zookeeper.server.quorum.LeaderElection;
 import org.apache.zookeeper.server.quorum.QuorumPeer;
 import org.apache.zookeeper.server.quorum.Vote;
@@ -216,9 +217,9 @@ public class LENonTerminateTest extends ZKTestCase {
         throws IOException
         {
             super(quorumPeers, snapDir, logDir, electionAlg,
-                    myid,tickTime, initLimit,syncLimit,
+                    myid,tickTime, initLimit,syncLimit, false,
                     ServerCnxnFactory.createFactory(clientPort, -1),
-                    new QuorumMaj(quorumPeers), null);
+                    new QuorumMaj(quorumPeers));
         }
 
         protected  Election createElectionAlgorithm(int electionAlgorithm){

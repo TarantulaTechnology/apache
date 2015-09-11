@@ -15,7 +15,7 @@ REM See the License for the specific language governing permissions and
 REM limitations under the License.
 
 set ZOOCFGDIR=%~dp0%..\conf
-set ZOO_LOG_DIR=%~dp0%..
+set ZOO_LOG_DIR=%~dp0%..\logs
 set ZOO_LOG4J_PROP=INFO,CONSOLE
 
 REM for sanity sake assume Java 1.6
@@ -31,4 +31,18 @@ REM make it work for developers
 SET CLASSPATH=%~dp0..\build\classes;%~dp0..\build\lib\*;%CLASSPATH%
 
 set ZOOCFG=%ZOOCFGDIR%\zoo.cfg
+
+@REM setup java environment variables
+
+if not defined JAVA_HOME (
+  echo Error: JAVA_HOME is not set.
+  goto :eof
+)
+
+if not exist %JAVA_HOME%\bin\java.exe (
+  echo Error: JAVA_HOME is incorrectly set.
+  goto :eof
+)
+
+set JAVA=%JAVA_HOME%\bin\java
 

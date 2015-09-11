@@ -52,19 +52,25 @@ public class TestOver {
         func = new Over("chararray");
         in = Schema.generateNestedSchema(DataType.BAG, DataType.INTEGER);
         out = func.outputSchema(in);
-        assertEquals("{{chararray}}", out.toString());
+        assertEquals("{org.apache.pig.piggybank.evaluation.over_1: {result: chararray}}", out.toString());
 
         // int
         func = new Over("Int");
         in = Schema.generateNestedSchema(DataType.BAG, DataType.INTEGER);
         out = func.outputSchema(in);
-        assertEquals("{{int}}", out.toString());
+        assertEquals("{org.apache.pig.piggybank.evaluation.over_2: {result: int}}", out.toString());
 
         // double
         func = new Over("DOUBLE");
         in = Schema.generateNestedSchema(DataType.BAG, DataType.INTEGER);
         out = func.outputSchema(in);
-        assertEquals("{{double}}", out.toString());
+        assertEquals("{org.apache.pig.piggybank.evaluation.over_3: {result: double}}", out.toString());
+
+        // named 
+        func = new Over("bob:chararray");
+        in = Schema.generateNestedSchema(DataType.BAG, DataType.INTEGER);
+        out = func.outputSchema(in);
+        assertEquals("{org.apache.pig.piggybank.evaluation.over_4: {bob: chararray}}", out.toString());
     }
 
     @Test
@@ -1610,6 +1616,13 @@ public class TestOver {
         t.set(4, 0);
         DataBag outbag = func.exec(t);
         assertEquals(7, outbag.size());
+        int count = 1;
+        for (Tuple to : outbag) {
+            assertEquals(1, to.size());
+            assertEquals(count/7.0, to.get(0));
+            count++;
+        }
+        /*
         Iterator<Tuple> iter = outbag.iterator();
         t = iter.next();
         assertEquals(0.14285714285714285, t.get(0));
@@ -1625,5 +1638,6 @@ public class TestOver {
         assertEquals(0.5714285714285714, t.get(0));
         t = iter.next();
         assertEquals(1.0, t.get(0));
+        */
     }
 }

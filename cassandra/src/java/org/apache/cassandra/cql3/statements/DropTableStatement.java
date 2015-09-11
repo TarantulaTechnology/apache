@@ -18,13 +18,16 @@
 package org.apache.cassandra.cql3.statements;
 
 import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.MaterializedViewDefinition;
+import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.CFName;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.UnauthorizedException;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
-import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.transport.Event;
 
 public class DropTableStatement extends SchemaAlteringStatement
 {
@@ -38,7 +41,15 @@ public class DropTableStatement extends SchemaAlteringStatement
 
     public void checkAccess(ClientState state) throws UnauthorizedException, InvalidRequestException
     {
-        state.hasColumnFamilyAccess(keyspace(), columnFamily(), Permission.DROP);
+        try
+        {
+            state.hasColumnFamilyAccess(keyspace(), columnFamily(), Permission.DROP);
+        }
+        catch (InvalidRequestException e)
+        {
+            if (!ifExists)
+                throw e;
+        }
     }
 
     public void validate(ClientState state)
@@ -46,21 +57,45 @@ public class DropTableStatement extends SchemaAlteringStatement
         // validated in announceMigration()
     }
 
-    public void announceMigration() throws ConfigurationException
+    public boolean announceMigration(boolean isLocalOnly) throws ConfigurationException
     {
         try
         {
-            MigrationManager.announceColumnFamilyDrop(keyspace(), columnFamily());
+            CFMetaData cfm = Schema.instance.getCFMetaData(keyspace(), columnFamily());
+            if (cfm != null)
+            {
+                if (cfm.isMaterializedView())
+                    throw new InvalidRequestException("Cannot use DROP TABLE on Materialized View");
+
+                boolean rejectDrop = false;
+                StringBuilder messageBuilder = new StringBuilder();
+                for (MaterializedViewDefinition def : cfm.getMaterializedViews())
+                {
+                    if (rejectDrop)
+                        messageBuilder.append(',');
+                    rejectDrop = true;
+                    messageBuilder.append(def.viewName);
+                }
+                if (rejectDrop)
+                {
+                    throw new InvalidRequestException(String.format("Cannot drop table when materialized views still depend on it (%s.{%s})",
+                                                                    keyspace(),
+                                                                    messageBuilder.toString()));
+                }
+            }
+            MigrationManager.announceColumnFamilyDrop(keyspace(), columnFamily(), isLocalOnly);
+            return true;
         }
         catch (ConfigurationException e)
         {
-            if (!ifExists)
-                throw e;
+            if (ifExists)
+                return false;
+            throw e;
         }
     }
 
-    public ResultMessage.SchemaChange.Change changeType()
+    public Event.SchemaChange changeEvent()
     {
-        return ResultMessage.SchemaChange.Change.DROPPED;
+        return new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TABLE, keyspace(), columnFamily());
     }
 }

@@ -100,6 +100,21 @@ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements 
     }
 
     /**
+     * Creates a thread pool that creates new threads as needed, but
+     * will reuse previously constructed threads when they are
+     * available.
+     * @param threadPoolName the name of the threads created by this executor
+     * @return The new DebuggableThreadPoolExecutor
+     */
+    public static DebuggableThreadPoolExecutor createCachedThreadpoolWithMaxSize(String threadPoolName)
+    {
+        return new DebuggableThreadPoolExecutor(0, Integer.MAX_VALUE,
+                                                60L, TimeUnit.SECONDS,
+                                                new SynchronousQueue<Runnable>(),
+                                                new NamedThreadFactory(threadPoolName));
+    }
+
+    /**
      * Returns a ThreadPoolExecutor with a fixed number of threads.
      * When all threads are actively executing tasks, new tasks are queued.
      * If (most) threads are expected to be idle most of the time, prefer createWithMaxSize() instead.
@@ -138,6 +153,11 @@ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements 
                       : new TraceSessionWrapper<Object>(command, state));
     }
 
+    public void maybeExecuteImmediately(Runnable command)
+    {
+        execute(command);
+    }
+
     // execute does not call newTaskFor
     @Override
     public void execute(Runnable command)
@@ -172,6 +192,12 @@ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements 
     {
         super.afterExecute(r, t);
 
+        maybeResetTraceSessionWrapper(r);
+        logExceptionsAfterExecute(r, t);
+    }
+
+    protected static void maybeResetTraceSessionWrapper(Runnable r)
+    {
         if (r instanceof TraceSessionWrapper)
         {
             TraceSessionWrapper tsw = (TraceSessionWrapper) r;
@@ -179,8 +205,6 @@ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements 
             // and if left this thread might start tracing unrelated tasks
             tsw.reset();
         }
-        
-        logExceptionsAfterExecute(r, t);
     }
 
     @Override

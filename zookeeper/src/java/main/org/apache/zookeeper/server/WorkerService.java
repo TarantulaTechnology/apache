@@ -26,6 +26,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.zookeeper.common.Time;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -130,14 +131,23 @@ public class WorkerService {
                 workRequest.cleanup();
             }
         } else {
-            scheduledWorkRequest.run();
+            // When there is no worker thread pool, do the work directly
+            // and wait for its completion
+            scheduledWorkRequest.start();
+            try {
+                scheduledWorkRequest.join();
+            } catch (InterruptedException e) {
+                LOG.warn("Unexpected exception", e);
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
-    private class ScheduledWorkRequest implements Runnable {
+    private class ScheduledWorkRequest extends ZooKeeperThread {
         private final WorkRequest workRequest;
 
         ScheduledWorkRequest(WorkRequest workRequest) {
+            super("ScheduledWorkRequest");
             this.workRequest = workRequest;
         }
 
@@ -218,11 +228,11 @@ public class WorkerService {
 
     public void join(long shutdownTimeoutMS) {
         // Give the worker threads time to finish executing
-        long now = System.currentTimeMillis();
+        long now = Time.currentElapsedTime();
         long endTime = now + shutdownTimeoutMS;
         for(ExecutorService worker : workers) {
             boolean terminated = false;
-            while ((now = System.currentTimeMillis()) <= endTime) {
+            while ((now = Time.currentElapsedTime()) <= endTime) {
                 try {
                     terminated = worker.awaitTermination(
                         endTime - now, TimeUnit.MILLISECONDS);

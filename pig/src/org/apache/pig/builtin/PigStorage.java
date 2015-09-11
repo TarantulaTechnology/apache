@@ -27,10 +27,13 @@ import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
 import org.apache.commons.cli.GnuParser;
 import org.apache.commons.cli.HelpFormatter;
+import org.apache.commons.cli.Option;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.compress.BZip2Codec;
@@ -50,6 +53,7 @@ import org.apache.pig.LoadCaster;
 import org.apache.pig.LoadFunc;
 import org.apache.pig.LoadMetadata;
 import org.apache.pig.LoadPushDown;
+import org.apache.pig.OverwritableStoreFunc;
 import org.apache.pig.PigException;
 import org.apache.pig.ResourceSchema;
 import org.apache.pig.ResourceSchema.ResourceFieldSchema;
@@ -58,13 +62,16 @@ import org.apache.pig.StoreFunc;
 import org.apache.pig.StoreFuncInterface;
 import org.apache.pig.StoreMetadata;
 import org.apache.pig.backend.executionengine.ExecException;
+import org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.MRConfiguration;
 import org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.PigSplit;
 import org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.PigTextInputFormat;
 import org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.PigTextOutputFormat;
+import org.apache.pig.backend.hadoop.executionengine.physicalLayer.relationalOperators.POStore;
 import org.apache.pig.bzip2r.Bzip2TextInputFormat;
 import org.apache.pig.data.DataByteArray;
 import org.apache.pig.data.Tuple;
 import org.apache.pig.data.TupleFactory;
+import org.apache.pig.impl.PigContext;
 import org.apache.pig.impl.logicalLayer.FrontendException;
 import org.apache.pig.impl.util.CastUtils;
 import org.apache.pig.impl.util.ObjectSerializer;
@@ -125,7 +132,7 @@ import org.apache.pig.parser.ParserException;
  */
 @SuppressWarnings("unchecked")
 public class PigStorage extends FileInputLoadFunc implements StoreFuncInterface,
-LoadPushDown, LoadMetadata, StoreMetadata {
+LoadPushDown, LoadMetadata, StoreMetadata, OverwritableStoreFunc {
     protected RecordReader in = null;
     protected RecordWriter writer = null;
     protected final Log mLog = LogFactory.getLog(getClass());
@@ -138,12 +145,9 @@ LoadPushDown, LoadMetadata, StoreMetadata {
 
     boolean isSchemaOn = false;
     boolean dontLoadSchema = false;
+    boolean overwriteOutput = false;
     protected ResourceSchema schema;
     protected LoadCaster caster;
-
-    private final CommandLine configuredOptions;
-    private final Options validOptions = new Options();
-    private final static CommandLineParser parser = new GnuParser();
 
     protected boolean[] mRequiredColumns = null;
     private boolean mRequiredColumnsInitialized = false;
@@ -155,12 +159,21 @@ LoadPushDown, LoadMetadata, StoreMetadata {
     private static final String TAG_SOURCE_PATH = "tagPath";
     private Path sourcePath = null;
 
-    private void populateValidOptions() {
+    private Options populateValidOptions() {
+        Options validOptions = new Options();
         validOptions.addOption("schema", false, "Loads / Stores the schema of the relation using a hidden JSON file.");
         validOptions.addOption("noschema", false, "Disable attempting to load data schema from the filesystem.");
         validOptions.addOption(TAG_SOURCE_FILE, false, "Appends input source file name to beginning of each tuple.");
         validOptions.addOption(TAG_SOURCE_PATH, false, "Appends input source file path to beginning of each tuple.");
         validOptions.addOption("tagsource", false, "Appends input source file name to beginning of each tuple.");
+        Option overwrite = new Option(" ", "Overwrites the destination.");
+        overwrite.setLongOpt("overwrite");
+        overwrite.setOptionalArg(true);
+        overwrite.setArgs(1);
+        overwrite.setArgName("overwrite");
+        validOptions.addOption(overwrite);
+        
+        return validOptions;
     }
 
     public PigStorage() {
@@ -194,12 +207,19 @@ LoadPushDown, LoadMetadata, StoreMetadata {
      * @throws ParseException
      */
     public PigStorage(String delimiter, String options) {
-        populateValidOptions();
         fieldDel = StorageUtil.parseFieldDel(delimiter);
+        Options validOptions = populateValidOptions();
         String[] optsArr = options.split(" ");
         try {
-            configuredOptions = parser.parse(validOptions, optsArr);
+            CommandLineParser parser = new GnuParser();
+            CommandLine configuredOptions = parser.parse(validOptions, optsArr);
             isSchemaOn = configuredOptions.hasOption("schema");
+            if (configuredOptions.hasOption("overwrite")) {
+                String value = configuredOptions.getOptionValue("overwrite");
+                if ("true".equalsIgnoreCase(value)) {
+                    overwriteOutput = true;
+                }
+            }       
             dontLoadSchema = configuredOptions.hasOption("noschema");
             tagFile = configuredOptions.hasOption(TAG_SOURCE_FILE);
             tagPath = configuredOptions.hasOption(TAG_SOURCE_PATH);
@@ -307,8 +327,12 @@ LoadPushDown, LoadMetadata, StoreMetadata {
             // only contains required fields.
             // We walk the requiredColumns array to find required fields,
             // and cast those.
-            for (int i = 0; i < Math.min(fieldSchemas.length, tup.size()); i++) {
+            for (int i = 0; i < fieldSchemas.length; i++) {
                 if (mRequiredColumns == null || (mRequiredColumns.length>i && mRequiredColumns[i])) {
+                    if (tupleIdx >= tup.size()) {
+                        tup.append(null);
+                    }
+                    
                     Object val = null;
                     if(tup.get(tupleIdx) != null){
                         byte[] bytes = ((DataByteArray) tup.get(tupleIdx)).get();
@@ -318,9 +342,6 @@ LoadPushDown, LoadMetadata, StoreMetadata {
                     }
                     tupleIdx++;
                 }
-            }
-            for (int i = tup.size(); i < fieldSchemas.length; i++) {
-                tup.append(null);
             }
         }
         return tup;
@@ -432,7 +453,7 @@ LoadPushDown, LoadMetadata, StoreMetadata {
 
     @Override
     public void setStoreLocation(String location, Job job) throws IOException {
-        job.getConfiguration().set("mapred.textoutputformat.separator", "");
+        job.getConfiguration().set(MRConfiguration.TEXTOUTPUTFORMAT_SEPARATOR, "");
         FileOutputFormat.setOutputPath(job, new Path(location));
 
         if( "true".equals( job.getConfiguration().get( "output.compression.enabled" ) ) ) {
@@ -566,5 +587,25 @@ LoadPushDown, LoadMetadata, StoreMetadata {
     public void storeStatistics(ResourceStatistics stats, String location,
             Job job) throws IOException {
 
+    }
+
+    @Override
+    public boolean shouldOverwrite() {
+        return this.overwriteOutput;
+    }
+
+    @Override
+    public void cleanupOutput(POStore store, Job job) throws IOException {
+        Configuration conf = job.getConfiguration();
+        String output = conf.get(MRConfiguration.OUTPUT_DIR);
+        Path outputPath = null;
+        if (output != null)
+            outputPath = new Path(output);
+        FileSystem fs = outputPath.getFileSystem(conf);
+        try {
+            fs.delete(outputPath, true);
+        } catch (Exception e) {
+            mLog.warn("Could not delete output " + output);
+        }
     }
 }

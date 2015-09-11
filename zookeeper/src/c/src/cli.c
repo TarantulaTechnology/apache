@@ -76,6 +76,8 @@ static const char* state2String(int state){
     return "ASSOCIATING_STATE";
   if (state == ZOO_CONNECTED_STATE)
     return "CONNECTED_STATE";
+  if (state == ZOO_READONLY_STATE)
+    return "READONLY_STATE";
   if (state == ZOO_EXPIRED_SESSION_STATE)
     return "EXPIRED_SESSION_STATE";
   if (state == ZOO_AUTH_FAILED_STATE)
@@ -182,10 +184,21 @@ void my_string_completion(int rc, const char *name, const void *data) {
       shutdownThisThing=1;
 }
 
+void my_string_completion_free_data(int rc, const char *name, const void *data) {
+    my_string_completion(rc, name, data);
+    free((void*)data);
+}
+
 void my_string_stat_completion(int rc, const char *name, const struct Stat *stat,
         const void *data)  {
     my_string_completion(rc, name, data);
     dumpStat(stat);
+}
+
+void my_string_stat_completion_free_data(int rc, const char *name,
+        const struct Stat *stat, const void *data)  {
+    my_string_stat_completion(rc, name, stat, data);
+    free((void*)data);
 }
 
 void my_data_completion(int rc, const char *value, int value_len,
@@ -544,10 +557,10 @@ void processline(char *line) {
 //        }
         if (is_create2) {
           rc = zoo_acreate2(zh, line, "new", 3, &ZOO_OPEN_ACL_UNSAFE, flags,
-                my_string_stat_completion, strdup(line));
+                my_string_stat_completion_free_data, strdup(line));
         } else {
           rc = zoo_acreate(zh, line, "new", 3, &ZOO_OPEN_ACL_UNSAFE, flags,
-                  my_string_completion, strdup(line));
+                my_string_completion_free_data, strdup(line));
         }
         if (rc) {
             fprintf(stderr, "Error %d for %s\n", rc, line);
@@ -572,7 +585,7 @@ void processline(char *line) {
             fprintf(stderr, "Path must start with /, found: %s\n", line);
             return;
         }
-        rc = zoo_async(zh, line, my_string_completion, strdup(line));
+        rc = zoo_async(zh, line, my_string_completion_free_data, strdup(line));
         if (rc) {
             fprintf(stderr, "Error %d for %s\n", rc, line);
         }
@@ -650,6 +663,7 @@ int main(int argc, char **argv) {
     char appId[64];
 #endif
     int bufoff = 0;
+    int flags, i;
     FILE *fh;
 
     if (argc < 2) {
@@ -679,6 +693,15 @@ int main(int argc, char **argv) {
         }
       }
     }
+
+    flags = 0;
+    for (i = 1; i < argc; ++i) {
+      if (strcmp("-r", argv[i]) == 0) {
+        flags = ZOO_READONLY;
+        break;
+      }
+    }
+
 #ifdef YCA
     strcpy(appId,"yahoo.example.yca_test");
     cert = yca_get_cert_once(appId);
@@ -697,7 +720,7 @@ int main(int argc, char **argv) {
     zoo_set_debug_level(ZOO_LOG_LEVEL_WARN);
     zoo_deterministic_conn_order(1); // enable deterministic order
     hostPort = argv[1];
-    zh = zookeeper_init(hostPort, watcher, 30000, &myid, 0, 0);
+    zh = zookeeper_init(hostPort, watcher, 30000, &myid, NULL, flags);
     if (!zh) {
         return errno;
     }

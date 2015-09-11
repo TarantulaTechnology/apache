@@ -18,19 +18,6 @@
 
 package org.apache.zookeeper.server;
 
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-
 import org.apache.jute.Index;
 import org.apache.jute.InputArchive;
 import org.apache.jute.OutputArchive;
@@ -43,10 +30,11 @@ import org.apache.zookeeper.Quotas;
 import org.apache.zookeeper.StatsTrack;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
-import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.Watcher.Event;
 import org.apache.zookeeper.Watcher.Event.EventType;
 import org.apache.zookeeper.Watcher.Event.KeeperState;
+import org.apache.zookeeper.Watcher.WatcherType;
+import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.common.PathTrie;
@@ -54,6 +42,7 @@ import org.apache.zookeeper.data.ACL;
 import org.apache.zookeeper.data.Stat;
 import org.apache.zookeeper.data.StatPersisted;
 import org.apache.zookeeper.txn.CheckVersionTxn;
+import org.apache.zookeeper.txn.CreateContainerTxn;
 import org.apache.zookeeper.txn.CreateTxn;
 import org.apache.zookeeper.txn.DeleteTxn;
 import org.apache.zookeeper.txn.ErrorTxn;
@@ -64,6 +53,20 @@ import org.apache.zookeeper.txn.Txn;
 import org.apache.zookeeper.txn.TxnHeader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * This class maintains the tree data structure. It doesn't have any networking
@@ -76,6 +79,8 @@ import org.slf4j.LoggerFactory;
  */
 public class DataTree {
     private static final Logger LOG = LoggerFactory.getLogger(DataTree.class);
+
+    public static final long CONTAINER_EPHEMERAL_OWNER = Long.MIN_VALUE;
 
     /**
      * This hashtable provides a fast lookup to the datanodes. The tree is the
@@ -129,6 +134,12 @@ public class DataTree {
         new ConcurrentHashMap<Long, HashSet<String>>();
 
     /**
+     * This set contains the paths of all container nodes
+     */
+    private final Set<String> containers =
+            Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+    /**
      * this is map from longs to acl's. It saves acl's being stored for each
      * datanode.
      */
@@ -157,6 +168,10 @@ public class DataTree {
             cloned = (HashSet<String>) retv.clone();
         }
         return cloned;
+    }
+
+    public Set<String> getContainers() {
+        return new HashSet<String>(containers);
     }
 
     int getAclSize() {
@@ -223,7 +238,7 @@ public class DataTree {
         return dataWatches.size() + childWatches.size();
     }
 
-    int getEphemeralsCount() {
+    public int getEphemeralsCount() {
         int result = 0;
         for (HashSet<String> set : ephemerals.values()) {
             result += set.size();
@@ -506,7 +521,9 @@ public class DataTree {
             DataNode child = new DataNode(data, longval, stat);
             parent.addChild(childName);
             nodes.put(path, child);
-            if (ephemeralOwner != 0) {
+            if (ephemeralOwner == CONTAINER_EPHEMERAL_OWNER) {
+                containers.add(path);
+            } else if (ephemeralOwner != 0) {
                 HashSet<String> list = ephemerals.get(ephemeralOwner);
                 if (list == null) {
                     list = new HashSet<String>();
@@ -572,7 +589,9 @@ public class DataTree {
             parent.removeChild(childName);
             parent.stat.setPzxid(zxid);
             long eowner = node.stat.getEphemeralOwner();
-            if (eowner != 0) {
+            if (eowner == CONTAINER_EPHEMERAL_OWNER) {
+                containers.remove(path);
+            } else if (eowner != 0) {
                 HashSet<String> nodes = ephemerals.get(eowner);
                 if (nodes != null) {
                     synchronized (nodes) {
@@ -823,7 +842,21 @@ public class DataTree {
                             header.getZxid(), header.getTime(), stat);
                     rc.stat = stat;
                     break;
+                case OpCode.createContainer:
+                    CreateContainerTxn createContainerTxn = (CreateContainerTxn) txn;
+                    rc.path = createContainerTxn.getPath();
+                    stat = new Stat();
+                    createNode(
+                            createContainerTxn.getPath(),
+                            createContainerTxn.getData(),
+                            createContainerTxn.getAcl(),
+                            CONTAINER_EPHEMERAL_OWNER,
+                            createContainerTxn.getParentCVersion(),
+                            header.getZxid(), header.getTime(), stat);
+                    rc.stat = stat;
+                    break;
                 case OpCode.delete:
+                case OpCode.deleteContainer:
                     DeleteTxn deleteTxn = (DeleteTxn) txn;
                     rc.path = deleteTxn.getPath();
                     deleteNode(deleteTxn.getPath(), header.getZxid());
@@ -873,7 +906,11 @@ public class DataTree {
                             case OpCode.create:
                                 record = new CreateTxn();
                                 break;
+                            case OpCode.createContainer:
+                                record = new CreateContainerTxn();
+                                break;
                             case OpCode.delete:
+                            case OpCode.deleteContainer:
                                 record = new DeleteTxn();
                                 break;
                             case OpCode.setData:
@@ -1137,14 +1174,20 @@ public class DataTree {
             return;
         }
         String children[] = null;
+        DataNode nodeCopy;
         synchronized (node) {
-            oa.writeString(pathString, "path");
-            oa.writeRecord(node, "node");
+            StatPersisted statCopy = new StatPersisted();
+            copyStatPersisted(node.stat, statCopy);
+            //we do not need to make a copy of node.data because the contents
+            //are never changed
+            nodeCopy = new DataNode(node.data, node.acl, statCopy);
             Set<String> childs = node.getChildren();
             if (childs != null) {
                 children = childs.toArray(new String[childs.size()]);
             }
         }
+        oa.writeString(pathString, "path");
+        oa.writeRecord(nodeCopy, "node");
         path.append('/');
         int off = path.length();
         if (children != null) {
@@ -1227,7 +1270,9 @@ public class DataTree {
                 }
                 parent.addChild(path.substring(lastSlash + 1));
                 long eowner = node.stat.getEphemeralOwner();
-                if (eowner != 0) {
+                if (eowner == CONTAINER_EPHEMERAL_OWNER) {
+                    containers.add(path);
+                } else if (eowner != 0) {
                     HashSet<String> list = ephemerals.get(eowner);
                     if (list == null) {
                         list = new HashSet<String>();
@@ -1264,6 +1309,36 @@ public class DataTree {
     }
 
     /**
+     * Returns a watch report.
+     *
+     * @return watch report
+     * @see WatchesReport
+     */
+    public synchronized WatchesReport getWatches() {
+        return dataWatches.getWatches();
+    }
+
+    /**
+     * Returns a watch report by path.
+     *
+     * @return watch report
+     * @see WatchesPathReport
+     */
+    public synchronized WatchesPathReport getWatchesByPath() {
+        return dataWatches.getWatchesByPath();
+    }
+
+    /**
+     * Returns a watch summary.
+     *
+     * @return watch summary
+     * @see WatchesSummary
+     */
+    public synchronized WatchesSummary getWatchesSummary() {
+        return dataWatches.getWatchesSummary();
+    }
+
+    /**
      * Write a text dump of all the ephemerals in the datatree.
      * @param pwriter the output to write to
      */
@@ -1275,12 +1350,29 @@ public class DataTree {
             pwriter.print("0x" + Long.toHexString(k));
             pwriter.println(":");
             HashSet<String> tmp = ephemerals.get(k);
-            synchronized (tmp) {
-                for (String path : tmp) {
-                    pwriter.println("\t" + path);
+            if (tmp != null) {
+                synchronized (tmp) {
+                    for (String path : tmp) {
+                        pwriter.println("\t" + path);
+                    }
                 }
             }
         }
+    }
+
+    /**
+     * Returns a mapping of session ID to ephemeral znodes.
+     *
+     * @return map of session ID to sets of ephemeral znodes
+     */
+    public Map<Long, Set<String>> getEphemerals() {
+        HashMap<Long, Set<String>> ephemeralsCopy = new HashMap<Long, Set<String>>();
+        for (Entry<Long, HashSet<String>> e : ephemerals.entrySet()) {
+            synchronized (e.getValue()) {
+                ephemeralsCopy.put(e.getKey(), new HashSet<String>(e.getValue()));
+            }
+        }
+        return ephemeralsCopy;
     }
 
     public void removeCnxn(Watcher watcher) {
@@ -1295,56 +1387,37 @@ public class DataTree {
             DataNode node = getNode(path);
             WatchedEvent e = null;
             if (node == null) {
-                e = new WatchedEvent(EventType.NodeDeleted,
-                        KeeperState.SyncConnected, path);
-            } else if (node.stat.getCzxid() > relativeZxid) {
-                e = new WatchedEvent(EventType.NodeCreated,
-                        KeeperState.SyncConnected, path);
+                watcher.process(new WatchedEvent(EventType.NodeDeleted, 
+                            KeeperState.SyncConnected, path));
             } else if (node.stat.getMzxid() > relativeZxid) {
-                e = new WatchedEvent(EventType.NodeDataChanged,
-                        KeeperState.SyncConnected, path);
-            }
-            if (e == null) {
-                this.dataWatches.addWatch(path, watcher);
+                watcher.process(new WatchedEvent(EventType.NodeDataChanged, 
+                            KeeperState.SyncConnected, path));
             } else {
-                watcher.process(e);
-            }
-        }
+                this.dataWatches.addWatch(path, watcher);
+            }    
+        }    
         for (String path : existWatches) {
             DataNode node = getNode(path);
-            WatchedEvent e = null;
-            if (node == null) {
-                // This is the case when the watch was registered
-            } else if (node.stat.getMzxid() > relativeZxid) {
-                e = new WatchedEvent(EventType.NodeDataChanged,
-                        KeeperState.SyncConnected, path);
+            if (node != null) {
+                watcher.process(new WatchedEvent(EventType.NodeCreated, 
+                            KeeperState.SyncConnected, path));
             } else {
-                e = new WatchedEvent(EventType.NodeCreated,
-                        KeeperState.SyncConnected, path);
-            }
-            if (e == null) {
                 this.dataWatches.addWatch(path, watcher);
-            } else {
-                watcher.process(e);
-            }
-        }
+            }    
+        }    
         for (String path : childWatches) {
             DataNode node = getNode(path);
-            WatchedEvent e = null;
             if (node == null) {
-                e = new WatchedEvent(EventType.NodeDeleted,
-                        KeeperState.SyncConnected, path);
+                watcher.process(new WatchedEvent(EventType.NodeDeleted, 
+                            KeeperState.SyncConnected, path));
             } else if (node.stat.getPzxid() > relativeZxid) {
-                e = new WatchedEvent(EventType.NodeChildrenChanged,
-                        KeeperState.SyncConnected, path);
-            }
-            if (e == null) {
-                this.childWatches.addWatch(path, watcher);
+                watcher.process(new WatchedEvent(EventType.NodeChildrenChanged, 
+                            KeeperState.SyncConnected, path));
             } else {
-                watcher.process(e);
-            }
-        }
-    }
+                this.childWatches.addWatch(path, watcher);
+            }    
+        }    
+    }    
 
      /**
       * This method sets the Cversion and Pzxid for the specified node to the
@@ -1380,5 +1453,47 @@ public class DataTree {
                 node.stat.setPzxid(zxid);
             }
         }
+    }
+
+    public boolean containsWatcher(String path, WatcherType type, Watcher watcher) {
+        boolean containsWatcher = false;
+        switch (type) {
+        case Children:
+            containsWatcher = this.childWatches.containsWatcher(path, watcher);
+            break;
+        case Data:
+            containsWatcher = this.dataWatches.containsWatcher(path, watcher);
+            break;
+        case Any:
+            if (this.childWatches.containsWatcher(path, watcher)) {
+                containsWatcher = true;
+            }
+            if (this.dataWatches.containsWatcher(path, watcher)) {
+                containsWatcher = true;
+            }
+            break;
+        }
+        return containsWatcher;
+    }
+
+    public boolean removeWatch(String path, WatcherType type, Watcher watcher) {
+        boolean removed = false;
+        switch (type) {
+        case Children:
+            removed = this.childWatches.removeWatcher(path, watcher);
+            break;
+        case Data:
+            removed = this.dataWatches.removeWatcher(path, watcher);
+            break;
+        case Any:
+            if (this.childWatches.removeWatcher(path, watcher)) {
+                removed = true;
+            }
+            if (this.dataWatches.removeWatcher(path, watcher)) {
+                removed = true;
+            }
+            break;
+        }
+        return removed;
     }
 }

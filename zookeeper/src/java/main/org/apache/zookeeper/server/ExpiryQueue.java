@@ -22,9 +22,12 @@ import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.ConcurrentHashMap;
+
+import org.apache.zookeeper.common.Time;
 
 /**
  * ExpiryQueue tracks elements in time sorted fixed duration buckets.
@@ -47,7 +50,7 @@ public class ExpiryQueue<E> {
 
     public ExpiryQueue(int expirationInterval) {
         this.expirationInterval = expirationInterval;
-        nextExpirationTime.set(roundToNextInterval(System.currentTimeMillis()));
+        nextExpirationTime.set(roundToNextInterval(Time.currentElapsedTime()));
     }
 
     private long roundToNextInterval(long time) {
@@ -83,7 +86,7 @@ public class ExpiryQueue<E> {
      */
     public Long update(E elem, int timeout) {
         Long prevExpiryTime = elemMap.get(elem);
-        long now = System.currentTimeMillis();
+        long now = Time.currentElapsedTime();
         Long newExpiryTime = roundToNextInterval(now + timeout);
 
         if (newExpiryTime.equals(prevExpiryTime)) {
@@ -122,7 +125,7 @@ public class ExpiryQueue<E> {
      * @return milliseconds until next expiration time, or 0 if has already past
      */
     public long getWaitTime() {
-        long now = System.currentTimeMillis();
+        long now = Time.currentElapsedTime();
         long expirationTime = nextExpirationTime.get();
         return now < expirationTime ? (expirationTime - now) : 0L;
     }
@@ -136,7 +139,7 @@ public class ExpiryQueue<E> {
      *         ready
      */
     public Set<E> poll() {
-        long now = System.currentTimeMillis();
+        long now = Time.currentElapsedTime();
         long expirationTime = nextExpirationTime.get();
         if (now < expirationTime) {
             return Collections.emptySet();
@@ -167,7 +170,7 @@ public class ExpiryQueue<E> {
             if (set != null) {
                 pwriter.print(set.size());
                 pwriter.print(" expire at ");
-                pwriter.print(new Date(time));
+                pwriter.print(Time.elapsedTimeToDate(time));
                 pwriter.println(":");
                 for (E elem : set) {
                     pwriter.print("\t");
@@ -175,6 +178,13 @@ public class ExpiryQueue<E> {
                 }
             }
         }
+    }
+
+    /**
+     * Returns an unmodifiable view of the expiration time -> elements mapping.
+     */
+    public Map<Long, Set<E>> getExpiryMap() {
+        return Collections.unmodifiableMap(expiryMap);
     }
 }
 

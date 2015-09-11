@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.pig.EvalFunc;
+import org.apache.pig.EvalFunc.SchemaType;
 import org.apache.pig.FuncSpec;
 import org.apache.pig.PigException;
 import org.apache.pig.PigWarning;
@@ -226,7 +227,7 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
     private String generateIncompatibleTypesMessage(BinaryExpression binOp)
     throws FrontendException {
         String msg = binOp.toString();
-        if (currentRelOp.getAlias()!=null){
+        if (currentRelOp != null && currentRelOp.getAlias() != null) {
             msg = "In alias " + currentRelOp.getAlias() + ", ";
         }
         LogicalFieldSchema lhsFs = binOp.getLhs().getFieldSchema();
@@ -487,7 +488,7 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
     public void visit(CastExpression cast) throws FrontendException {
         byte inType = cast.getExpression().getType();
         byte outType = cast.getType();
-        if(outType == DataType.BYTEARRAY){
+        if(outType == DataType.BYTEARRAY && inType != outType) {
             int errCode = 1051;
             String msg = "Cannot cast to bytearray";
             msgCollector.collect(msg, MessageType.Error) ;
@@ -710,6 +711,9 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
             throw new TypeCheckerException(func, msg, errCode, PigException.INPUT, e);
         }
 
+        // EvalFunc's schema type
+        SchemaType udfSchemaType = ef.getSchemaType();
+
         /**
          * Here is an explanation of the way the matching UDF funcspec will be chosen
          * based on actual types in the input schema.
@@ -751,7 +755,7 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
         if(funcSpecs!=null && funcSpecs.size()!=0){
             //Some function mappings found. Trying to see
             //if one of them fits the input schema
-            if((matchingSpec = exactMatch(funcSpecs, currentArgSchema, func))==null){
+            if((matchingSpec = exactMatch(funcSpecs, currentArgSchema, func, udfSchemaType))==null){
                 //Oops, no exact match found. Trying to see if we
                 //have mappings that we can fit using casts.
                 notExactMatch = true;
@@ -759,9 +763,9 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
                     // try "exact" matching all other fields except the byte array
                     // fields and if they all exact match and we have only one candidate
                     // for the byte array cast then that's the matching one!
-                    if((matchingSpec = exactMatchWithByteArrays(funcSpecs, currentArgSchema, func))==null){
+                    if((matchingSpec = exactMatchWithByteArrays(funcSpecs, currentArgSchema, func, udfSchemaType))==null){
                         // "exact" match with byte arrays did not work - try best fit match
-                        if((matchingSpec = bestFitMatchWithByteArrays(funcSpecs, currentArgSchema, func)) == null) {
+                        if((matchingSpec = bestFitMatchWithByteArrays(funcSpecs, currentArgSchema, func, udfSchemaType)) == null) {
                             int errCode = 1045;
                             String msg = "Could not infer the matching function for "
                                 + func.getFuncSpec()
@@ -770,7 +774,7 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
                             throw new TypeCheckerException(func, msg, errCode, PigException.INPUT);
                         }
                     }
-                } else if ((matchingSpec = bestFitMatch(funcSpecs, currentArgSchema)) == null) {
+                } else if ((matchingSpec = bestFitMatch(funcSpecs, currentArgSchema, udfSchemaType)) == null) {
                     // Either no byte arrays found or there are byte arrays
                     // but only one mapping exists.
                     // However, we could not find a match as there were either
@@ -801,7 +805,7 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
             matchingSpec.setCtorArgs(func.getFuncSpec().getCtorArgs());
             }
             func.setFuncSpec(matchingSpec);
-            insertCastsForUDF(func, currentArgSchema, matchingSpec.getInputArgsSchema());
+            insertCastsForUDF(func, currentArgSchema, matchingSpec.getInputArgsSchema(), udfSchemaType);
 
         }
     }
@@ -816,18 +820,20 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
      *            input schema
      * @param func -
      *             udf expression
+     * @param udfSchemaType -
+     *            schema type of the udf
      * @return the funcSpec that supports the schema that is best suited to s.
      *         The best suited schema is one that has the lowest score as
      *         returned by fitPossible().
      * @throws VisitorException
      */
     private FuncSpec bestFitMatchWithByteArrays(List<FuncSpec> funcSpecs,
-            Schema s, UserFuncExpression func) throws VisitorException {
+            Schema s, UserFuncExpression func, SchemaType udfSchemaType) throws VisitorException {
                 List<Pair<Long, FuncSpec>> scoreFuncSpecList = new ArrayList<Pair<Long,FuncSpec>>();
         for (Iterator<FuncSpec> iterator = funcSpecs.iterator(); iterator
                 .hasNext();) {
             FuncSpec fs = iterator.next();
-            long score = fitPossible(s, fs.getInputArgsSchema());
+            long score = fitPossible(s, fs.getInputArgsSchema(), udfSchemaType);
             if (score != INF) {
                 scoreFuncSpecList.add(new Pair<Long, FuncSpec>(score, fs));
             }
@@ -906,6 +912,7 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
         /* (non-Javadoc)
          * @see java.util.Comparator#compare(java.lang.Object, java.lang.Object)
          */
+        @Override
         public int compare(Pair<Long, FuncSpec> o1, Pair<Long, FuncSpec> o2) {
             if(o1.first < o2.first)
                 return -1;
@@ -926,14 +933,15 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
      * @param funcSpecs - mappings provided by udf
      * @param s - input schema
      * @param func - UserFuncExpression for which matching is requested
+     * @param udfSchemaType - schema type of the udf
      * @return the matching spec if found else null
      * @throws FrontendException
      */
     private FuncSpec exactMatchWithByteArrays(List<FuncSpec> funcSpecs,
-            Schema s, UserFuncExpression func) throws FrontendException {
+            Schema s, UserFuncExpression func, SchemaType udfSchemaType) throws FrontendException {
         // exact match all fields except byte array fields
         // ignore byte array fields for matching
-        return exactMatchHelper(funcSpecs, s, func, true);
+        return exactMatchHelper(funcSpecs, s, func, udfSchemaType, true);
     }
 
     /**
@@ -943,13 +951,14 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
      * @param funcSpecs - mappings provided by udf
      * @param s - input schema
      * @param func - UserFuncExpression for which matching is requested
+     * @param udfSchemaType - schema type of the user defined function
      * @return the matching spec if found else null
      * @throws FrontendException
      */
     private FuncSpec exactMatch(List<FuncSpec> funcSpecs, Schema s,
-            UserFuncExpression func) throws FrontendException {
+            UserFuncExpression func, SchemaType udfSchemaType) throws FrontendException {
         // exact match all fields, don't ignore byte array fields
-        return exactMatchHelper(funcSpecs, s, func, false);
+        return exactMatchHelper(funcSpecs, s, func, udfSchemaType, false);
     }
 
     /**
@@ -957,18 +966,19 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
      * be obtained by inserting a set of casts to the input schema
      * @param funcSpecs - mappings provided by udf
      * @param s - input schema
+     * @param udfSchemaType - schema type of the udf
      * @return the funcSpec that supports the schema that is best suited
      *          to s. The best suited schema is one that has the
      *          lowest score as returned by fitPossible().
      */
-    private FuncSpec bestFitMatch(List<FuncSpec> funcSpecs, Schema s) {
+    private FuncSpec bestFitMatch(List<FuncSpec> funcSpecs, Schema s, SchemaType udfSchemaType) {
         FuncSpec matchingSpec = null;
         long score = INF;
         long prevBestScore = Long.MAX_VALUE;
         long bestScore = Long.MAX_VALUE;
         for (Iterator<FuncSpec> iterator = funcSpecs.iterator(); iterator.hasNext();) {
             FuncSpec fs = iterator.next();
-            score = fitPossible(s,fs.getInputArgsSchema());
+            score = fitPossible(s,fs.getInputArgsSchema(), udfSchemaType);
             if(score!=INF && score<=bestScore){
                 matchingSpec = fs;
                 prevBestScore = bestScore;
@@ -1037,18 +1047,19 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
      * @param funcSpecs - mappings provided by udf
      * @param s - input schema
      * @param func user defined function
+     * @param udfSchemaType - schema type of the user defined function
      * @param ignoreByteArrays - flag for whether the exact match is to computed
      * after ignoring bytearray (if true) or without ignoring bytearray (if false)
      * @return the matching spec if found else null
      * @throws FrontendException
      */
     private FuncSpec exactMatchHelper(List<FuncSpec> funcSpecs, Schema s,
-            UserFuncExpression func, boolean ignoreByteArrays)
+            UserFuncExpression func, SchemaType udfSchemaType, boolean ignoreByteArrays)
     throws FrontendException {
         List<FuncSpec> matchingSpecs = new ArrayList<FuncSpec>();
         for (Iterator<FuncSpec> iterator = funcSpecs.iterator(); iterator.hasNext();) {
             FuncSpec fs = iterator.next();
-            if (schemaEqualsForMatching(s, fs.getInputArgsSchema(), ignoreByteArrays)) {
+            if (schemaEqualsForMatching(s, fs.getInputArgsSchema(), udfSchemaType, ignoreByteArrays)) {
                 matchingSpecs.add(fs);
 
             }
@@ -1087,7 +1098,7 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
      * @throws FrontendException
      */
     public static boolean schemaEqualsForMatching(Schema inputSchema,
-            Schema udfSchema, boolean ignoreByteArrays) throws FrontendException {
+            Schema udfSchema, SchemaType udfSchemaType, boolean ignoreByteArrays) throws FrontendException {
 
 
         // If both of them are null, they are equal
@@ -1108,20 +1119,23 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
         // fix that!
         udfSchema = Util.fixSchemaAddTupleInBag(udfSchema);
 
-
-        if (inputSchema.size() != udfSchema.size())
+        if ((udfSchemaType == SchemaType.NORMAL) && (inputSchema.size() != udfSchema.size()))
+            return false;
+        if ((udfSchemaType == SchemaType.VARARG) && inputSchema.size() < udfSchema.size())
             return false;
 
         Iterator<FieldSchema> i = inputSchema.getFields().iterator();
         Iterator<FieldSchema> j = udfSchema.getFields().iterator();
 
+        FieldSchema udfFieldSchema = null;
         while (i.hasNext()) {
 
             FieldSchema inputFieldSchema = i.next();
-            FieldSchema udfFieldSchema = j.next();
             if(inputFieldSchema == null)
                 return false;
 
+            //if there's no more UDF field: take the last one which is the vararg field
+            udfFieldSchema = j.hasNext() ? j.next() : udfFieldSchema;
 
             if(ignoreByteArrays && inputFieldSchema.type == DataType.BYTEARRAY) {
                 continue;
@@ -1293,13 +1307,17 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
      * Unallowed casts are returned a dist of INFINITY.
      * @param s1
      * @param s2
+     * @param s2Type
      * @return
      */
-    private long fitPossible(Schema s1, Schema s2) {
+    private long fitPossible(Schema s1, Schema s2, SchemaType s2Type) {
         if(s1==null || s2==null) return INF;
         List<FieldSchema> sFields = s1.getFields();
         List<FieldSchema> fsFields = s2.getFields();
-        if(sFields.size()!=fsFields.size())
+
+        if((s2Type == SchemaType.NORMAL) && (sFields.size()!=fsFields.size()))
+            return INF;
+        if((s2Type == SchemaType.VARARG) && (sFields.size() < fsFields.size()))
             return INF;
         long score = 0;
         int castCnt=0;
@@ -1316,7 +1334,9 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
             if (sFS.type == DataType.BYTEARRAY)
                 continue;
 
-            FieldSchema fsFS = fsFields.get(i);
+            //if we get to the vararg field (if defined) : take it repeatedly
+            FieldSchema fsFS = ((s2Type == SchemaType.VARARG) && i >= s2.size()) ?
+                    fsFields.get(s2.size() - 1) : fsFields.get(i);
 
             if(DataType.isSchemaType(sFS.type)){
                 if(!FieldSchema.equals(sFS, fsFS, false, true))
@@ -1333,7 +1353,7 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
         return score * castCnt;
     }
 
-    private void insertCastsForUDF(UserFuncExpression func, Schema fromSch, Schema toSch)
+    private void insertCastsForUDF(UserFuncExpression func, Schema fromSch, Schema toSch, SchemaType toSchType)
     throws FrontendException {
         List<FieldSchema> fsLst = fromSch.getFields();
         List<FieldSchema> tsLst = toSch.getFields();
@@ -1341,8 +1361,10 @@ public class TypeCheckingExpVisitor extends LogicalExpressionVisitor{
         int i=-1;
         for (FieldSchema fFSch : fsLst) {
             ++i;
-            FieldSchema tFSch = tsLst.get(i);
-            if(fFSch.type==tFSch.type) {
+            //if we get to the vararg field (if defined) : take it repeatedly
+            FieldSchema tFSch = ((toSchType == SchemaType.VARARG) && i >= tsLst.size()) ?
+                    tsLst.get(tsLst.size() - 1) : tsLst.get(i);
+            if (fFSch.type == tFSch.type) {
                 continue;
             }
             insertCast(func, Util.translateFieldSchema(tFSch), args.get(i));

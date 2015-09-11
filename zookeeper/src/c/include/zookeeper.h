@@ -93,6 +93,13 @@ enum ZOO_ERRORS {
   ZOPERATIONTIMEOUT = -7, /*!< Operation timeout */
   ZBADARGUMENTS = -8, /*!< Invalid arguments */
   ZINVALIDSTATE = -9, /*!< Invliad zhandle state */
+  ZNEWCONFIGNOQUORUM = -13, /*!< No quorum of new config is connected and
+                                 up-to-date with the leader of last commmitted
+                                 config - try invoking reconfiguration after new
+                                 servers are connected and synced */
+  ZRECONFIGINPROGRESS = -14, /*!< Reconfiguration requested while another
+                                  reconfiguration is currently in progress. This
+                                  is currently not supported. Please retry. */
 
   /** API errors.
    * This is never thrown by the server, it shouldn't be used other than
@@ -114,10 +121,10 @@ enum ZOO_ERRORS {
   ZCLOSING = -116, /*!< ZooKeeper is closing */
   ZNOTHING = -117, /*!< (not error) no server responses to process */
   ZSESSIONMOVED = -118, /*!<session moved to another server, so operation is ignored */
-  ZNEWCONFIGNOQUORUM = -120,  /*!< No quorum of new config is connected and up-to-date with the leader of last commmitted config - try
-                                 invoking reconfiguration after new servers are connected and synced */
-  ZRECONFIGINPROGRESS = -121  /*!< Reconfiguration requested while another reconfiguration is currently in progress. This is currently
-                                       not supported. Please retry. */
+  ZNOTREADONLY = -119, /*!< state-changing request is passed to read-only server */
+  ZEPHEMERALONLOCALSESSION = -120, /*!< Attempt to create ephemeral node on a local session */
+  ZNOWATCHER = -121, /*!< The watcher couldn't be found */
+  ZRWSERVERFOUND = -122 /*!< r/w server found while in r/o mode */
 };
 
 #ifdef __cplusplus
@@ -141,6 +148,9 @@ extern ZOOAPI const int ZOO_PERM_ALL;
 
 
 #define ZOO_CONFIG_NODE "/zookeeper/config"
+
+/* flags for zookeeper_init{,2} */
+#define ZOO_READONLY         1
 
 /** This Id represents anyone. */
 extern ZOOAPI struct Id ZOO_ANYONE_ID_UNSAFE;
@@ -191,6 +201,7 @@ extern ZOOAPI const int ZOO_AUTH_FAILED_STATE;
 extern ZOOAPI const int ZOO_CONNECTING_STATE;
 extern ZOOAPI const int ZOO_ASSOCIATING_STATE;
 extern ZOOAPI const int ZOO_CONNECTED_STATE;
+extern ZOOAPI const int ZOO_READONLY_STATE;
 extern ZOOAPI const int ZOO_NOTCONNECTED_STATE;
 // @}
 
@@ -1989,6 +2000,62 @@ ZOOAPI int zoo_set_acl(zhandle_t *zh, const char *path, int version,
  * \ref zoo_acreate, \ref zoo_adelete, \ref zoo_aset).
  */
 ZOOAPI int zoo_multi(zhandle_t *zh, int count, const zoo_op_t *ops, zoo_op_result_t *results);
+
+/**
+ * Type of watchers: used to select which type of watchers should be removed
+ */
+typedef enum {
+  ZWATCHERTYPE_CHILDREN = 1,
+  ZWATCHERTYPE_DATA = 2,
+  ZWATCHERTYPE_ANY = 3
+} ZooWatcherType;
+
+/**
+ * \brief removes the watchers for the given path and watcher type.
+ *
+ * \param zh the zookeeper handle obtained by a call to \ref zookeeper_init
+ * \param path the path for which watchers will be removed
+ * \param wtype the watcher type to be removed
+ * \param watcher the watcher to be removed, if null all watchers for that
+ * path (and watcher type) will be removed
+ * \param watcherCtx the contex associated with the watcher to be removed
+ * \param local whether the watchers will be removed locally even if there is
+ * no server connection
+ * \return the return code for the function call.
+ * ZOK - operation completed successfully
+ * ZNOWATCHER - the watcher couldn't be found.
+ * ZINVALIDSTATE - if !local, zhandle state is either ZOO_SESSION_EXPIRED_STATE
+ * or ZOO_AUTH_FAILED_STATE
+ * ZBADARGUMENTS - invalid input parameters
+ * ZMARSHALLINGERROR - failed to marshall a request; possibly, out of memory
+ * ZSYSTEMERROR - a system error occured
+ */
+ZOOAPI int zoo_remove_watchers(zhandle_t *zh, const char *path,
+        ZooWatcherType wtype, watcher_fn watcher, void *watcherCtx, int local);
+
+/**
+ * \brief removes the watchers for the given path and watcher type.
+ *
+ * \param zh the zookeeper handle obtained by a call to \ref zookeeper_init
+ * \param path the path for which watchers will be removed
+ * \param wtype the watcher type to be removed
+ * \param watcher the watcher to be removed, if null all watchers for that
+ * path (and watcher type) will be removed
+ * \param watcherCtx the contex associated with the watcher to be removed
+ * \param local whether the watchers will be removed locally even if there is
+ * no server connection
+ * \return the return code for the function call.
+ * ZOK - operation completed successfully
+ * ZNOWATCHER - the watcher couldn't be found.
+ * ZINVALIDSTATE - if !local, zhandle state is either ZOO_SESSION_EXPIRED_STATE
+ * or ZOO_AUTH_FAILED_STATE
+ * ZBADARGUMENTS - invalid input parameters
+ * ZMARSHALLINGERROR - failed to marshall a request; possibly, out of memory
+ * ZSYSTEMERROR - a system error occured
+ */
+ZOOAPI int zoo_aremove_watchers(zhandle_t *zh, const char *path,
+        ZooWatcherType wtype, watcher_fn watcher, void *watcherCtx, int local,
+        void_completion_t *completion, const void *data);
 
 #ifdef __cplusplus
 }

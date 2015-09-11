@@ -21,7 +21,11 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
+import java.nio.charset.Charset;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CoderResult;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -29,44 +33,58 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
-import org.jboss.netty.util.CharsetUtil;
+import io.netty.buffer.*;
+import io.netty.util.CharsetUtil;
 
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.UUIDGen;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
- * ChannelBuffer utility methods.
+ * ByteBuf utility methods.
  * Note that contrarily to ByteBufferUtil, these method do "read" the
- * ChannelBuffer advancing it's (read) position. They also write by
+ * ByteBuf advancing its (read) position. They also write by
  * advancing the write position. Functions are also provided to create
- * ChannelBuffer while avoiding copies.
+ * ByteBuf while avoiding copies.
  */
 public abstract class CBUtil
 {
+    public static final boolean USE_HEAP_ALLOCATOR = Boolean.getBoolean(Config.PROPERTY_PREFIX + "netty_use_heap_allocator");
+    public static final ByteBufAllocator allocator = USE_HEAP_ALLOCATOR ? new UnpooledByteBufAllocator(false) : new PooledByteBufAllocator(true);
+
     private CBUtil() {}
 
-    private static String readString(ChannelBuffer cb, int length)
+    private final static ThreadLocal<CharsetDecoder> decoder = new ThreadLocal<CharsetDecoder>()
     {
+        @Override
+        protected CharsetDecoder initialValue()
+        {
+            return Charset.forName("UTF-8").newDecoder();
+        }
+    };
+
+    private static String readString(ByteBuf cb, int length)
+    {
+        if (length == 0)
+            return "";
+
+        ByteBuffer buffer = cb.nioBuffer(cb.readerIndex(), length);
         try
         {
-            String str = cb.toString(cb.readerIndex(), length, CharsetUtil.UTF_8);
+            String str = decodeString(buffer);
             cb.readerIndex(cb.readerIndex() + length);
             return str;
         }
-        catch (IllegalStateException e)
+        catch (IllegalStateException | CharacterCodingException e)
         {
-            // That's the way netty encapsulate a CCE
-            if (e.getCause() instanceof CharacterCodingException)
-                throw new ProtocolException("Cannot decode string as UTF8");
-            else
-                throw e;
+            throw new ProtocolException("Cannot decode string as UTF8: '" + ByteBufferUtil.bytesToHex(buffer) + "'; " + e);
         }
     }
 
-    public static String readString(ChannelBuffer cb)
+    public static String readString(ByteBuf cb)
     {
         try
         {
@@ -75,11 +93,34 @@ public abstract class CBUtil
         }
         catch (IndexOutOfBoundsException e)
         {
-            throw new ProtocolException("Not enough bytes to read an UTF8 serialized string preceded by it's 2 bytes length");
+            throw new ProtocolException("Not enough bytes to read an UTF8 serialized string preceded by its 2 bytes length");
         }
     }
 
-    public static void writeString(String str, ChannelBuffer cb)
+    // Taken from Netty's ChannelBuffers.decodeString(). We need to use our own decoder to properly handle invalid
+    // UTF-8 sequences.  See CASSANDRA-8101 for more details.  This can be removed once https://github.com/netty/netty/pull/2999
+    // is resolved in a release used by Cassandra.
+    private static String decodeString(ByteBuffer src) throws CharacterCodingException
+    {
+        // the decoder needs to be reset every time we use it, hence the copy per thread
+        CharsetDecoder theDecoder = decoder.get();
+        theDecoder.reset();
+
+        final CharBuffer dst = CharBuffer.allocate(
+                (int) ((double) src.remaining() * theDecoder.maxCharsPerByte()));
+
+        CoderResult cr = theDecoder.decode(src, dst, true);
+        if (!cr.isUnderflow())
+            cr.throwException();
+
+        cr = theDecoder.flush(dst);
+        if (!cr.isUnderflow())
+            cr.throwException();
+
+        return dst.flip().toString();
+    }
+
+    public static void writeString(String str, ByteBuf cb)
     {
         byte[] bytes = str.getBytes(CharsetUtil.UTF_8);
         cb.writeShort(bytes.length);
@@ -91,7 +132,7 @@ public abstract class CBUtil
         return 2 + TypeSizes.encodedUTF8Length(str);
     }
 
-    public static String readLongString(ChannelBuffer cb)
+    public static String readLongString(ByteBuf cb)
     {
         try
         {
@@ -100,11 +141,11 @@ public abstract class CBUtil
         }
         catch (IndexOutOfBoundsException e)
         {
-            throw new ProtocolException("Not enough bytes to read an UTF8 serialized string preceded by it's 4 bytes length");
+            throw new ProtocolException("Not enough bytes to read an UTF8 serialized string preceded by its 4 bytes length");
         }
     }
 
-    public static void writeLongString(String str, ChannelBuffer cb)
+    public static void writeLongString(String str, ByteBuf cb)
     {
         byte[] bytes = str.getBytes(CharsetUtil.UTF_8);
         cb.writeInt(bytes.length);
@@ -116,7 +157,7 @@ public abstract class CBUtil
         return 4 + str.getBytes(CharsetUtil.UTF_8).length;
     }
 
-    public static byte[] readBytes(ChannelBuffer cb)
+    public static byte[] readBytes(ByteBuf cb)
     {
         try
         {
@@ -127,11 +168,11 @@ public abstract class CBUtil
         }
         catch (IndexOutOfBoundsException e)
         {
-            throw new ProtocolException("Not enough bytes to read a byte array preceded by it's 2 bytes length");
+            throw new ProtocolException("Not enough bytes to read a byte array preceded by its 2 bytes length");
         }
     }
 
-    public static void writeBytes(byte[] bytes, ChannelBuffer cb)
+    public static void writeBytes(byte[] bytes, ByteBuf cb)
     {
         cb.writeShort(bytes.length);
         cb.writeBytes(bytes);
@@ -142,12 +183,46 @@ public abstract class CBUtil
         return 2 + bytes.length;
     }
 
-    public static ConsistencyLevel readConsistencyLevel(ChannelBuffer cb)
+    public static Map<String, ByteBuffer> readBytesMap(ByteBuf cb)
+    {
+        int length = cb.readUnsignedShort();
+        Map<String, ByteBuffer> m = new HashMap<>(length);
+        for (int i = 0; i < length; i++)
+        {
+            String k = readString(cb);
+            ByteBuffer v = readValue(cb);
+            m.put(k, v);
+        }
+        return m;
+    }
+
+    public static void writeBytesMap(Map<String, ByteBuffer> m, ByteBuf cb)
+    {
+        cb.writeShort(m.size());
+        for (Map.Entry<String, ByteBuffer> entry : m.entrySet())
+        {
+            writeString(entry.getKey(), cb);
+            writeValue(entry.getValue(), cb);
+        }
+    }
+
+    public static int sizeOfBytesMap(Map<String, ByteBuffer> m)
+    {
+        int size = 2;
+        for (Map.Entry<String, ByteBuffer> entry : m.entrySet())
+        {
+            size += sizeOfString(entry.getKey());
+            size += sizeOfValue(entry.getValue());
+        }
+        return size;
+    }
+
+    public static ConsistencyLevel readConsistencyLevel(ByteBuf cb)
     {
         return ConsistencyLevel.fromCode(cb.readUnsignedShort());
     }
 
-    public static void writeConsistencyLevel(ConsistencyLevel consistency, ChannelBuffer cb)
+    public static void writeConsistencyLevel(ConsistencyLevel consistency, ByteBuf cb)
     {
         cb.writeShort(consistency.code);
     }
@@ -157,7 +232,7 @@ public abstract class CBUtil
         return 2;
     }
 
-    public static <T extends Enum<T>> T readEnumValue(Class<T> enumType, ChannelBuffer cb)
+    public static <T extends Enum<T>> T readEnumValue(Class<T> enumType, ByteBuf cb)
     {
         String value = CBUtil.readString(cb);
         try
@@ -170,7 +245,7 @@ public abstract class CBUtil
         }
     }
 
-    public static <T extends Enum<T>> void writeEnumValue(T enumValue, ChannelBuffer cb)
+    public static <T extends Enum<T>> void writeEnumValue(T enumValue, ByteBuf cb)
     {
         writeString(enumValue.toString(), cb);
     }
@@ -180,14 +255,14 @@ public abstract class CBUtil
         return sizeOfString(enumValue.toString());
     }
 
-    public static UUID readUUID(ChannelBuffer cb)
+    public static UUID readUUID(ByteBuf cb)
     {
         byte[] bytes = new byte[16];
         cb.readBytes(bytes);
         return UUIDGen.getUUID(ByteBuffer.wrap(bytes));
     }
 
-    public static void writeUUID(UUID uuid, ChannelBuffer cb)
+    public static void writeUUID(UUID uuid, ByteBuf cb)
     {
         cb.writeBytes(UUIDGen.decompose(uuid));
     }
@@ -197,7 +272,7 @@ public abstract class CBUtil
         return 16;
     }
 
-    public static List<String> readStringList(ChannelBuffer cb)
+    public static List<String> readStringList(ByteBuf cb)
     {
         int length = cb.readUnsignedShort();
         List<String> l = new ArrayList<String>(length);
@@ -206,7 +281,7 @@ public abstract class CBUtil
         return l;
     }
 
-    public static void writeStringList(List<String> l, ChannelBuffer cb)
+    public static void writeStringList(List<String> l, ByteBuf cb)
     {
         cb.writeShort(l.size());
         for (String str : l)
@@ -221,20 +296,20 @@ public abstract class CBUtil
         return size;
     }
 
-    public static Map<String, String> readStringMap(ChannelBuffer cb)
+    public static Map<String, String> readStringMap(ByteBuf cb)
     {
         int length = cb.readUnsignedShort();
         Map<String, String> m = new HashMap<String, String>(length);
         for (int i = 0; i < length; i++)
         {
-            String k = readString(cb).toUpperCase();
+            String k = readString(cb);
             String v = readString(cb);
             m.put(k, v);
         }
         return m;
     }
 
-    public static void writeStringMap(Map<String, String> m, ChannelBuffer cb)
+    public static void writeStringMap(Map<String, String> m, ByteBuf cb)
     {
         cb.writeShort(m.size());
         for (Map.Entry<String, String> entry : m.entrySet())
@@ -255,7 +330,7 @@ public abstract class CBUtil
         return size;
     }
 
-    public static Map<String, List<String>> readStringToStringListMap(ChannelBuffer cb)
+    public static Map<String, List<String>> readStringToStringListMap(ByteBuf cb)
     {
         int length = cb.readUnsignedShort();
         Map<String, List<String>> m = new HashMap<String, List<String>>(length);
@@ -268,7 +343,7 @@ public abstract class CBUtil
         return m;
     }
 
-    public static void writeStringToStringListMap(Map<String, List<String>> m, ChannelBuffer cb)
+    public static void writeStringToStringListMap(Map<String, List<String>> m, ByteBuf cb)
     {
         cb.writeShort(m.size());
         for (Map.Entry<String, List<String>> entry : m.entrySet())
@@ -289,13 +364,36 @@ public abstract class CBUtil
         return size;
     }
 
-    public static ByteBuffer readValue(ChannelBuffer cb)
+    public static ByteBuffer readValue(ByteBuf cb)
     {
         int length = cb.readInt();
-        return length < 0 ? null : cb.readSlice(length).toByteBuffer();
+        if (length < 0)
+            return null;
+        ByteBuf slice = cb.readSlice(length);
+
+        return ByteBuffer.wrap(readRawBytes(slice));
     }
 
-    public static void writeValue(byte[] bytes, ChannelBuffer cb)
+    public static ByteBuffer readBoundValue(ByteBuf cb, int protocolVersion)
+    {
+        int length = cb.readInt();
+        if (length < 0)
+        {
+            if (protocolVersion < 4) // backward compatibility for pre-version 4
+                return null;
+            if (length == -1)
+                return null;
+            else if (length == -2)
+                return ByteBufferUtil.UNSET_BYTE_BUFFER;
+            else
+                throw new ProtocolException("Invalid ByteBuf length " + length);
+        }
+        ByteBuf slice = cb.readSlice(length);
+
+        return ByteBuffer.wrap(readRawBytes(slice));
+    }
+
+    public static void writeValue(byte[] bytes, ByteBuf cb)
     {
         if (bytes == null)
         {
@@ -307,7 +405,7 @@ public abstract class CBUtil
         cb.writeBytes(bytes);
     }
 
-    public static void writeValue(ByteBuffer bytes, ChannelBuffer cb)
+    public static void writeValue(ByteBuffer bytes, ByteBuf cb)
     {
         if (bytes == null)
         {
@@ -315,8 +413,11 @@ public abstract class CBUtil
             return;
         }
 
-        cb.writeInt(bytes.remaining());
-        cb.writeBytes(bytes.duplicate());
+        int remaining = bytes.remaining();
+        cb.writeInt(remaining);
+
+        if (remaining > 0)
+            cb.writeBytes(bytes.duplicate());
     }
 
     public static int sizeOfValue(byte[] bytes)
@@ -329,7 +430,7 @@ public abstract class CBUtil
         return 4 + (bytes == null ? 0 : bytes.remaining());
     }
 
-    public static List<ByteBuffer> readValueList(ChannelBuffer cb)
+    public static List<ByteBuffer> readValueList(ByteBuf cb, int protocolVersion)
     {
         int size = cb.readUnsignedShort();
         if (size == 0)
@@ -337,11 +438,11 @@ public abstract class CBUtil
 
         List<ByteBuffer> l = new ArrayList<ByteBuffer>(size);
         for (int i = 0; i < size; i++)
-            l.add(readValue(cb));
+            l.add(readBoundValue(cb, protocolVersion));
         return l;
     }
 
-    public static void writeValueList(List<ByteBuffer> values, ChannelBuffer cb)
+    public static void writeValueList(List<ByteBuffer> values, ByteBuf cb)
     {
         cb.writeShort(values.size());
         for (ByteBuffer value : values)
@@ -356,7 +457,23 @@ public abstract class CBUtil
         return size;
     }
 
-    public static InetSocketAddress readInet(ChannelBuffer cb)
+    public static Pair<List<String>, List<ByteBuffer>> readNameAndValueList(ByteBuf cb, int protocolVersion)
+    {
+        int size = cb.readUnsignedShort();
+        if (size == 0)
+            return Pair.create(Collections.<String>emptyList(), Collections.<ByteBuffer>emptyList());
+
+        List<String> s = new ArrayList<>(size);
+        List<ByteBuffer> l = new ArrayList<>(size);
+        for (int i = 0; i < size; i++)
+        {
+            s.add(readString(cb));
+            l.add(readBoundValue(cb, protocolVersion));
+        }
+        return Pair.create(s, l);
+    }
+
+    public static InetSocketAddress readInet(ByteBuf cb)
     {
         int addrSize = cb.readByte();
         byte[] address = new byte[addrSize];
@@ -372,7 +489,7 @@ public abstract class CBUtil
         }
     }
 
-    public static void writeInet(InetSocketAddress inet, ChannelBuffer cb)
+    public static void writeInet(InetSocketAddress inet, ByteBuf cb)
     {
         byte[] address = inet.getAddress().getAddress();
 
@@ -389,20 +506,12 @@ public abstract class CBUtil
 
     /*
      * Reads *all* readable bytes from {@code cb} and return them.
-     * If {@code cb} is backed by an array, this will return the underlying array directly, without copy.
      */
-    public static byte[] readRawBytes(ChannelBuffer cb)
+    public static byte[] readRawBytes(ByteBuf cb)
     {
-        if (cb.hasArray() && cb.readableBytes() == cb.array().length)
-        {
-            // Move the readerIndex just so we consistenly consume the input
-            cb.readerIndex(cb.writerIndex());
-            return cb.array();
-        }
-
-        // Otherwise, just read the bytes in a new array
         byte[] bytes = new byte[cb.readableBytes()];
         cb.readBytes(bytes);
         return bytes;
     }
+
 }

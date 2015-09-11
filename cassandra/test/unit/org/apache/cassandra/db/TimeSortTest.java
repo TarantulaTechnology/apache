@@ -18,122 +18,79 @@
 */
 package org.apache.cassandra.db;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.util.concurrent.ExecutionException;
-import java.util.*;
-
+import java.util.Iterator;
 import org.junit.Test;
-import static org.junit.Assert.assertEquals;
 
-import org.apache.cassandra.SchemaLoader;
-import static org.apache.cassandra.Util.getBytes;
+import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.Util;
 
-import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.db.marshal.LongType;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import static org.junit.Assert.assertEquals;
 
-
-public class TimeSortTest extends SchemaLoader
+public class TimeSortTest extends CQLTester
 {
     @Test
-    public void testMixedSources() throws IOException, ExecutionException, InterruptedException
+    public void testMixedSources() throws Throwable
     {
-        Keyspace keyspace = Keyspace.open("Keyspace1");
-        ColumnFamilyStore cfStore = keyspace.getColumnFamilyStore("StandardLong1");
-        RowMutation rm;
-        DecoratedKey key = Util.dk("key0");
+        String tableName = createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
 
-        rm = new RowMutation("Keyspace1", key.key);
-        rm.add("StandardLong1", getBytes(100), ByteBufferUtil.bytes("a"), 100);
-        rm.apply();
-        cfStore.forceBlockingFlush();
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?) USING TIMESTAMP ?", 0, 100, 0, 100L);
+        cfs.forceBlockingFlush();
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?) USING TIMESTAMP ?", 0, 0, 1, 0L);
 
-        rm = new RowMutation("Keyspace1", key.key);
-        rm.add("StandardLong1", getBytes(0), ByteBufferUtil.bytes("b"), 0);
-        rm.apply();
-
-        ColumnFamily cf = cfStore.getColumnFamily(key, getBytes(10), ByteBufferUtil.EMPTY_BYTE_BUFFER, false, 1000, System.currentTimeMillis());
-        Collection<Column> columns = cf.getSortedColumns();
-        assert columns.size() == 1;
+        assertRows(execute("SELECT * FROM %s WHERE a = ? AND b >= ? LIMIT 1000", 0, 10), row(0, 100, 0));
     }
 
     @Test
-    public void testTimeSort() throws IOException, ExecutionException, InterruptedException
+    public void testTimeSort() throws Throwable
     {
-        Keyspace keyspace = Keyspace.open("Keyspace1");
-        ColumnFamilyStore cfStore = keyspace.getColumnFamilyStore("StandardLong1");
+        String tableName = createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
 
         for (int i = 900; i < 1000; ++i)
-        {
-            RowMutation rm = new RowMutation("Keyspace1", ByteBufferUtil.bytes(Integer.toString(i)));
             for (int j = 0; j < 8; ++j)
-            {
-                rm.add("StandardLong1", getBytes(j * 2), ByteBufferUtil.bytes("a"), j * 2);
-            }
-            rm.apply();
-        }
+                execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?) USING TIMESTAMP ?", i, j * 2, 0, (long)j * 2);
 
-        validateTimeSort(keyspace);
-
-        cfStore.forceBlockingFlush();
-        validateTimeSort(keyspace);
+        validateTimeSort();
+        cfs.forceBlockingFlush();
+        validateTimeSort();
 
         // interleave some new data to test memtable + sstable
         DecoratedKey key = Util.dk("900");
-        RowMutation rm = new RowMutation("Keyspace1", key.key);
         for (int j = 0; j < 4; ++j)
-        {
-            rm.add("StandardLong1", getBytes(j * 2 + 1), ByteBufferUtil.bytes("b"), j * 2 + 1);
-        }
-        rm.apply();
+            execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?) USING TIMESTAMP ?", 900, j * 2 + 1, 1, (long)j * 2 + 1);
+
         // and some overwrites
-        rm = new RowMutation("Keyspace1", key.key);
-        rm.add("StandardLong1", getBytes(0), ByteBufferUtil.bytes("c"), 100);
-        rm.add("StandardLong1", getBytes(10), ByteBufferUtil.bytes("c"), 100);
-        rm.apply();
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?) USING TIMESTAMP ?", 900, 0, 2, 100L);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?) USING TIMESTAMP ?", 900, 10, 2, 100L);
 
         // verify
-        ColumnFamily cf = cfStore.getColumnFamily(key, getBytes(0), ByteBufferUtil.EMPTY_BYTE_BUFFER, false, 1000, System.currentTimeMillis());
-        Collection<Column> columns = cf.getSortedColumns();
-        assertEquals(12, columns.size());
-        Iterator<Column> iter = columns.iterator();
-        Column column;
+        UntypedResultSet results = execute("SELECT * FROM %s WHERE a = ? AND b >= ? LIMIT 1000", 900, 0);
+        assertEquals(12, results.size());
+        Iterator<UntypedResultSet.Row> iter = results.iterator();
         for (int j = 0; j < 8; j++)
         {
-            column = iter.next();
-            assert column.name().equals(getBytes(j));
+            UntypedResultSet.Row row = iter.next();
+            assertEquals(j, row.getInt("b"));
         }
-        TreeSet<ByteBuffer> columnNames = new TreeSet<ByteBuffer>(LongType.instance);
-        columnNames.add(getBytes(10));
-        columnNames.add(getBytes(0));
-        cf = cfStore.getColumnFamily(QueryFilter.getNamesFilter(Util.dk("900"), "StandardLong1", columnNames, System.currentTimeMillis()));
-        assert "c".equals(ByteBufferUtil.string(cf.getColumn(getBytes(0)).value()));
-        assert "c".equals(ByteBufferUtil.string(cf.getColumn(getBytes(10)).value()));
+
+        assertRows(execute("SELECT * FROM %s WHERE a = ? AND b IN (?, ?)", 900, 0, 10),
+                row(900, 0, 2),
+                row(900, 10, 2));
     }
 
-    private void validateTimeSort(Keyspace keyspace) throws IOException
+    private void validateTimeSort() throws Throwable
     {
         for (int i = 900; i < 1000; ++i)
         {
-            DecoratedKey key = Util.dk(Integer.toString(i));
             for (int j = 0; j < 8; j += 3)
             {
-                ColumnFamily cf = keyspace.getColumnFamilyStore("StandardLong1").getColumnFamily(key,
-                                                                                                 getBytes(j * 2),
-                                                                                                 ByteBufferUtil.EMPTY_BYTE_BUFFER,
-                                                                                                 false,
-                                                                                                 1000,
-                                                                                                 System.currentTimeMillis());
-                Collection<Column> columns = cf.getSortedColumns();
-                assert columns.size() == 8 - j;
+                UntypedResultSet results = execute("SELECT writetime(c) AS wt FROM %s WHERE a = ? AND b >= ? LIMIT 1000", i, j * 2);
+                assertEquals(8 - j, results.size());
                 int k = j;
-                for (Column c : columns)
-                {
-                    assertEquals((k++) * 2, c.timestamp());
-
-                }
+                for (UntypedResultSet.Row row : results)
+                    assertEquals((k++) * 2, row.getLong("wt"));
             }
         }
     }

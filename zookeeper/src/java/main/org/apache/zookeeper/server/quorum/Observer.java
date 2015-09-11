@@ -82,7 +82,7 @@ public class Observer extends Learner{
                     readPacket(qp);
                     processPacket(qp);
                 }
-            } catch (IOException e) {
+            } catch (Exception e) {
                 LOG.warn("Exception when observing the leader", e);
                 try {
                     sock.close();
@@ -153,6 +153,9 @@ public class Observer extends Learner{
             if (majorChange) {
                throw new Exception("changes proposed in reconfig");
            }            
+            break;
+        default:
+            LOG.warn("Unknown packet type: {}", LearnerHandler.packetToString(qp));
             break;
         }
     }

@@ -28,6 +28,7 @@ import org.apache.zookeeper.server.ServerCnxnFactory;
 import org.apache.zookeeper.server.ZKDatabase;
 import org.apache.zookeeper.server.DatadirCleanupManager;
 import org.apache.zookeeper.server.ZooKeeperServerMain;
+import org.apache.zookeeper.server.admin.AdminServer.AdminServerException;
 import org.apache.zookeeper.server.persistence.FileTxnSnapLog;
 import org.apache.zookeeper.server.persistence.FileTxnSnapLog.DatadirException;
 import org.apache.zookeeper.server.quorum.QuorumPeerConfig.ConfigException;
@@ -89,6 +90,10 @@ public class QuorumPeerMain {
             LOG.error("Unable to access datadir, exiting abnormally", e);
             System.err.println("Unable to access datadir, exiting abnormally");
             System.exit(3);
+        } catch (AdminServerException e) {
+            LOG.error("Unable to start AdminServer, exiting abnormally", e);
+            System.err.println("Unable to start AdminServer, exiting abnormally");
+            System.exit(4);
         } catch (Exception e) {
             LOG.error("Unexpected exception, exiting abnormally", e);
             System.exit(1);
@@ -98,7 +103,7 @@ public class QuorumPeerMain {
     }
 
     protected void initializeAndRun(String[] args)
-        throws ConfigException, IOException
+        throws ConfigException, IOException, AdminServerException
     {
         QuorumPeerConfig config = new QuorumPeerConfig();
         if (args.length == 1) {
@@ -110,7 +115,7 @@ public class QuorumPeerMain {
                 .getDataDir(), config.getDataLogDir(), config
                 .getSnapRetainCount(), config.getPurgeInterval());
         purgeMgr.start();
-        
+
         if (args.length == 1 && config.isDistributed()) {
             runFromConfig(config);
         } else {
@@ -121,23 +126,39 @@ public class QuorumPeerMain {
         }
     }
 
-    public void runFromConfig(QuorumPeerConfig config) throws IOException {
+    public void runFromConfig(QuorumPeerConfig config) throws IOException, AdminServerException {
       try {
           ManagedUtil.registerLog4jMBeans();
       } catch (JMException e) {
           LOG.warn("Unable to register log4j JMX control", e);
       }
-  
+
       LOG.info("Starting quorum peer");
       try {
-          ServerCnxnFactory cnxnFactory = ServerCnxnFactory.createFactory();
-          cnxnFactory.configure(config.getClientPortAddress(),
-                                config.getMaxClientCnxns());
-  
-          quorumPeer = new QuorumPeer();          
+          ServerCnxnFactory cnxnFactory = null;
+          ServerCnxnFactory secureCnxnFactory = null;
+
+          if (config.getClientPortAddress() != null) {
+              cnxnFactory = ServerCnxnFactory.createFactory();
+              cnxnFactory.configure(config.getClientPortAddress(),
+                      config.getMaxClientCnxns(),
+                      false);
+          }
+
+          if (config.getSecureClientPortAddress() != null) {
+              secureCnxnFactory = ServerCnxnFactory.createFactory();
+              secureCnxnFactory.configure(config.getSecureClientPortAddress(),
+                      config.getMaxClientCnxns(),
+                      true);
+          }
+
+          quorumPeer = new QuorumPeer();
           quorumPeer.setTxnFactory(new FileTxnSnapLog(
                       config.getDataLogDir(),
                       config.getDataDir()));
+          quorumPeer.enableLocalSessions(config.areLocalSessionsEnabled());
+          quorumPeer.enableLocalSessionsUpgrading(
+              config.isLocalSessionsUpgradingEnabled());
           //quorumPeer.setQuorumPeers(config.getAllMembers());
           quorumPeer.setElectionType(config.getElectionAlg());
           quorumPeer.setMyid(config.getServerId());
@@ -146,9 +167,7 @@ public class QuorumPeerMain {
           quorumPeer.setMaxSessionTimeout(config.getMaxSessionTimeout());
           quorumPeer.setInitLimit(config.getInitLimit());
           quorumPeer.setSyncLimit(config.getSyncLimit());
-          quorumPeer.setDynamicConfigFilename(config.getDynamicConfigFilename());
           quorumPeer.setConfigFileName(config.getConfigFilename());
-          quorumPeer.setConfigBackwardCompatibility(config.getConfigBackwardCompatibility());
           quorumPeer.setZKDatabase(new ZKDatabase(quorumPeer.getTxnFactory()));
           quorumPeer.setQuorumVerifier(config.getQuorumVerifier(), false);
           if (config.getLastSeenQuorumVerifier()!=null) {
@@ -156,7 +175,10 @@ public class QuorumPeerMain {
           }
           quorumPeer.initConfigInZKDatabase();
           quorumPeer.setCnxnFactory(cnxnFactory);
+          quorumPeer.setSecureCnxnFactory(secureCnxnFactory);
           quorumPeer.setLearnerType(config.getPeerType());
+          quorumPeer.setSyncEnabled(config.getSyncEnabled());
+          quorumPeer.setQuorumListenOnAllIPs(config.getQuorumListenOnAllIPs());
           
           quorumPeer.start();
           quorumPeer.join();

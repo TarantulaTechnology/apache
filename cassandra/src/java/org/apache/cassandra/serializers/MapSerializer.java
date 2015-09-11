@@ -18,11 +18,13 @@
 
 package org.apache.cassandra.serializers;
 
-import org.apache.cassandra.utils.Pair;
-
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.*;
+
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.utils.Pair;
 
 public class MapSerializer<K, V> extends CollectionSerializer<Map<K, V>>
 {
@@ -31,48 +33,86 @@ public class MapSerializer<K, V> extends CollectionSerializer<Map<K, V>>
 
     public final TypeSerializer<K> keys;
     public final TypeSerializer<V> values;
+    private final Comparator<Pair<ByteBuffer, ByteBuffer>> comparator;
 
-    public static synchronized <K, V> MapSerializer<K, V> getInstance(TypeSerializer<K> keys, TypeSerializer<V> values)
+    public static synchronized <K, V> MapSerializer<K, V> getInstance(TypeSerializer<K> keys, TypeSerializer<V> values, Comparator<ByteBuffer> comparator)
     {
         Pair<TypeSerializer<?>, TypeSerializer<?>> p = Pair.<TypeSerializer<?>, TypeSerializer<?>>create(keys, values);
         MapSerializer<K, V> t = instances.get(p);
         if (t == null)
         {
-            t = new MapSerializer<K, V>(keys, values);
+            t = new MapSerializer<K, V>(keys, values, comparator);
             instances.put(p, t);
         }
         return t;
     }
 
-    private MapSerializer(TypeSerializer<K> keys, TypeSerializer<V> values)
+    private MapSerializer(TypeSerializer<K> keys, TypeSerializer<V> values, Comparator<ByteBuffer> comparator)
     {
         this.keys = keys;
         this.values = values;
+        this.comparator = (p1, p2) -> comparator.compare(p1.left, p2.left);
     }
 
-    public Map<K, V> deserialize(ByteBuffer bytes)
+    public List<ByteBuffer> serializeValues(Map<K, V> map)
+    {
+        List<Pair<ByteBuffer, ByteBuffer>> pairs = new ArrayList<>(map.size());
+        for (Map.Entry<K, V> entry : map.entrySet())
+            pairs.add(Pair.create(keys.serialize(entry.getKey()), values.serialize(entry.getValue())));
+        Collections.sort(pairs, comparator);
+        List<ByteBuffer> buffers = new ArrayList<>(pairs.size() * 2);
+        for (Pair<ByteBuffer, ByteBuffer> p : pairs)
+        {
+            buffers.add(p.left);
+            buffers.add(p.right);
+        }
+        return buffers;
+    }
+
+    public int getElementCount(Map<K, V> value)
+    {
+        return value.size();
+    }
+
+    public void validateForNativeProtocol(ByteBuffer bytes, int version)
     {
         try
         {
             ByteBuffer input = bytes.duplicate();
-            int n = getUnsignedShort(input);
+            int n = readCollectionSize(input, version);
+            for (int i = 0; i < n; i++)
+            {
+                keys.validate(readValue(input, version));
+                values.validate(readValue(input, version));
+            }
+            if (input.hasRemaining())
+                throw new MarshalException("Unexpected extraneous bytes after map value");
+        }
+        catch (BufferUnderflowException e)
+        {
+            throw new MarshalException("Not enough bytes to read a map");
+        }
+    }
+
+    public Map<K, V> deserializeForNativeProtocol(ByteBuffer bytes, int version)
+    {
+        try
+        {
+            ByteBuffer input = bytes.duplicate();
+            int n = readCollectionSize(input, version);
             Map<K, V> m = new LinkedHashMap<K, V>(n);
             for (int i = 0; i < n; i++)
             {
-                int sk = getUnsignedShort(input);
-                byte[] datak = new byte[sk];
-                input.get(datak);
-                ByteBuffer kbb = ByteBuffer.wrap(datak);
+                ByteBuffer kbb = readValue(input, version);
                 keys.validate(kbb);
 
-                int sv = getUnsignedShort(input);
-                byte[] datav = new byte[sv];
-                input.get(datav);
-                ByteBuffer vbb = ByteBuffer.wrap(datav);
+                ByteBuffer vbb = readValue(input, version);
                 values.validate(vbb);
 
                 m.put(keys.deserialize(kbb), values.deserialize(vbb));
             }
+            if (input.hasRemaining())
+                throw new MarshalException("Unexpected extraneous bytes after map value");
             return m;
         }
         catch (BufferUnderflowException e)
@@ -82,49 +122,53 @@ public class MapSerializer<K, V> extends CollectionSerializer<Map<K, V>>
     }
 
     /**
-     * Layout is: {@code <n><sk_1><k_1><sv_1><v_1>...<sk_n><k_n><sv_n><v_n> }
-     * where:
-     *   n is the number of elements
-     *   sk_i is the number of bytes composing the ith key k_i
-     *   k_i is the sk_i bytes composing the ith key
-     *   sv_i is the number of bytes composing the ith value v_i
-     *   v_i is the sv_i bytes composing the ith value
+     * Given a serialized map, gets the value associated with a given key.
+     * @param serializedMap a serialized map
+     * @param serializedKey a serialized key
+     * @param keyType the key type for the map
+     * @return the value associated with the key if one exists, null otherwise
      */
-    public ByteBuffer serialize(Map<K, V> value)
+    public ByteBuffer getSerializedValue(ByteBuffer serializedMap, ByteBuffer serializedKey, AbstractType keyType)
     {
-        List<ByteBuffer> bbs = new ArrayList<ByteBuffer>(2 * value.size());
-        int size = 0;
-        for (Map.Entry<K, V> entry : value.entrySet())
+        try
         {
-            ByteBuffer bbk = keys.serialize(entry.getKey());
-            ByteBuffer bbv = values.serialize(entry.getValue());
-            bbs.add(bbk);
-            bbs.add(bbv);
-            size += 4 + bbk.remaining() + bbv.remaining();
+            ByteBuffer input = serializedMap.duplicate();
+            int n = readCollectionSize(input, Server.VERSION_3);
+            for (int i = 0; i < n; i++)
+            {
+                ByteBuffer kbb = readValue(input, Server.VERSION_3);
+                ByteBuffer vbb = readValue(input, Server.VERSION_3);
+                int comparison = keyType.compare(kbb, serializedKey);
+                if (comparison == 0)
+                    return vbb;
+                else if (comparison > 0)
+                    // since the map is in sorted order, we know we've gone too far and the element doesn't exist
+                    return null;
+            }
+            return null;
         }
-        return pack(bbs, value.size(), size);
+        catch (BufferUnderflowException e)
+        {
+            throw new MarshalException("Not enough bytes to read a map");
+        }
     }
 
     public String toString(Map<K, V> value)
     {
         StringBuilder sb = new StringBuilder();
+        sb.append('{');
         boolean isFirst = true;
         for (Map.Entry<K, V> element : value.entrySet())
         {
             if (isFirst)
-            {
                 isFirst = false;
-            }
             else
-            {
-                sb.append("; ");
-            }
-            sb.append('(');
+                sb.append(", ");
             sb.append(keys.toString(element.getKey()));
-            sb.append(", ");
+            sb.append(": ");
             sb.append(values.toString(element.getValue()));
-            sb.append(')');
         }
+        sb.append('}');
         return sb.toString();
     }
 

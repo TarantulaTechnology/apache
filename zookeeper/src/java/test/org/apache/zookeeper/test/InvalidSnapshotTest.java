@@ -71,6 +71,17 @@ public class InvalidSnapshotTest extends ZKTestCase implements Watcher {
     }
     
     /**
+     * Verify the SnapshotFormatter by running it on a known file with one null data.
+     */
+    @Test
+    public void testSnapshotFormatterWithNull() throws Exception {
+        File snapDir = new File(testData, "invalidsnap");
+        File snapfile = new File(new File(snapDir, "version-2"), "snapshot.273");
+        String[] args = {snapfile.getCanonicalFile().toString()};
+        SnapshotFormatter.main(args);
+    }
+    
+    /**
      * test the snapshot
      * @throws Exception an exception could be expected
      */
@@ -95,6 +106,7 @@ public class InvalidSnapshotTest extends ZKTestCase implements Watcher {
             zk.close();
         }
         f.shutdown();
+        zks.shutdown();
         Assert.assertTrue("waiting for server down",
                    ClientBase.waitForServerDown(HOSTPORT,
                            ClientBase.CONNECTION_TIMEOUT));

@@ -41,7 +41,7 @@
 #include <stdarg.h>
 #include <limits.h>
 
-#ifndef WIN32
+#ifndef _WIN32
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <poll.h>
@@ -49,7 +49,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <unistd.h>
+#include <unistd.h> // needed for _POSIX_MONOTONIC_CLOCK
 #include "config.h"
 #else
 #include "winstdint.h"
@@ -61,6 +61,11 @@
 
 #ifdef HAVE_GETPWUID_R
 #include <pwd.h>
+#endif
+
+#ifdef __MACH__ // OS X
+#include <mach/clock.h>
+#include <mach/mach.h>
 #endif
 
 #define IF_DEBUG(x) if(logLevel==ZOO_LOG_LEVEL_DEBUG) {x;}
@@ -76,6 +81,7 @@ const int ZOO_AUTH_FAILED_STATE = AUTH_FAILED_STATE_DEF;
 const int ZOO_CONNECTING_STATE = CONNECTING_STATE_DEF;
 const int ZOO_ASSOCIATING_STATE = ASSOCIATING_STATE_DEF;
 const int ZOO_CONNECTED_STATE = CONNECTED_STATE_DEF;
+const int ZOO_READONLY_STATE = READONLY_STATE_DEF;
 const int ZOO_NOTCONNECTED_STATE = NOTCONNECTED_STATE_DEF;
 
 static __attribute__ ((unused)) const char* state2String(int state){
@@ -88,6 +94,8 @@ static __attribute__ ((unused)) const char* state2String(int state){
         return "ZOO_ASSOCIATING_STATE";
     case CONNECTED_STATE_DEF:
         return "ZOO_CONNECTED_STATE";
+    case READONLY_STATE_DEF:
+        return "ZOO_READONLY_STATE";
     case EXPIRED_SESSION_STATE_DEF:
         return "ZOO_EXPIRED_SESSION_STATE";
     case AUTH_FAILED_STATE_DEF:
@@ -177,6 +185,7 @@ typedef struct _completion_list {
     buffer_list_t *buffer;
     struct _completion_list *next;
     watcher_registration_t* watcher;
+    watcher_deregistration_t* watcher_deregistration;
 } completion_list_t;
 
 const char*err2string(int err);
@@ -191,9 +200,23 @@ static int deserialize_multi(zhandle_t *zh, int xid, completion_list_t *cptr, st
 static int add_completion(zhandle_t *zh, int xid, int completion_type,
         const void *dc, const void *data, int add_to_front,
         watcher_registration_t* wo, completion_head_t *clist);
+static int add_completion_deregistration(zhandle_t *zh, int xid,
+        int completion_type, const void *dc, const void *data,
+        int add_to_front, watcher_deregistration_t* wo,
+        completion_head_t *clist);
+static int do_add_completion(zhandle_t *zh, const void *dc, completion_list_t *c,
+        int add_to_front);
+
 static completion_list_t* create_completion_entry(zhandle_t *zh, int xid, int completion_type,
         const void *dc, const void *data, watcher_registration_t* wo,
         completion_head_t *clist);
+static completion_list_t* create_completion_entry_deregistration(zhandle_t *zh,
+        int xid, int completion_type, const void *dc, const void *data,
+        watcher_deregistration_t* wo, completion_head_t *clist);
+static completion_list_t* do_create_completion_entry(zhandle_t *zh,
+        int xid, int completion_type, const void *dc, const void *data,
+        watcher_registration_t* wo, completion_head_t *clist,
+        watcher_deregistration_t* wdo);
 static void destroy_completion_entry(completion_list_t* c);
 static void queue_completion_nolock(completion_head_t *list, completion_list_t *c,
         int add_to_front);
@@ -210,17 +233,98 @@ static __attribute__((unused)) void print_completion_queue(zhandle_t *zh);
 static void *SYNCHRONOUS_MARKER = (void*)&SYNCHRONOUS_MARKER;
 static int isValidPath(const char* path, const int flags);
 
-#ifdef _WINDOWS
-static int zookeeper_send(SOCKET s, const void* buf, int len)
+#ifdef _WIN32
+typedef SOCKET socket_t;
+typedef int sendsize_t;
+#define SEND_FLAGS  0
 #else
-static ssize_t zookeeper_send(int s, const void* buf, size_t len)
+#ifdef __APPLE__
+#define SEND_FLAGS SO_NOSIGPIPE
 #endif
-{
 #ifdef __linux__
-  return send(s, buf, len, MSG_NOSIGNAL);
-#else
-  return send(s, buf, len, 0);
+#define SEND_FLAGS MSG_NOSIGNAL
 #endif
+#ifndef SEND_FLAGS
+#define SEND_FLAGS 0
+#endif
+typedef int socket_t;
+typedef ssize_t sendsize_t;
+#endif
+
+static void zookeeper_set_sock_nodelay(zhandle_t *, socket_t);
+static void zookeeper_set_sock_noblock(zhandle_t *, socket_t);
+static void zookeeper_set_sock_timeout(zhandle_t *, socket_t, int);
+static socket_t zookeeper_connect(zhandle_t *, struct sockaddr_storage *, socket_t);
+
+
+static sendsize_t zookeeper_send(socket_t s, const void* buf, size_t len)
+{
+    return send(s, buf, len, SEND_FLAGS);
+}
+
+/**
+ * Get the system time.
+ *
+ * If the monotonic clock is available, we use that.  The monotonic clock does
+ * not change when the wall-clock time is adjusted by NTP or the system
+ * administrator.  The monotonic clock returns a value which is monotonically
+ * increasing.
+ *
+ * If POSIX monotonic clocks are not available, we fall back on the wall-clock.
+ *
+ * @param tv         (out param) The time.
+ */
+void get_system_time(struct timeval *tv)
+{
+  int ret;
+
+#ifdef __MACH__ // OS X
+  clock_serv_t cclock;
+  mach_timespec_t mts;
+  ret = host_get_clock_service(mach_host_self(), SYSTEM_CLOCK, &cclock);
+  if (!ret) {
+    ret += clock_get_time(cclock, &mts);
+    ret += mach_port_deallocate(mach_task_self(), cclock);
+    if (!ret) {
+      tv->tv_sec = mts.tv_sec;
+      tv->tv_usec = mts.tv_nsec / 1000;
+    }
+  }
+  if (ret) {
+    // Default to gettimeofday in case of failure.
+    ret = gettimeofday(tv, NULL);
+  }
+#elif CLOCK_MONOTONIC_RAW
+  // On Linux, CLOCK_MONOTONIC is affected by ntp slew but CLOCK_MONOTONIC_RAW
+  // is not.  We want the non-slewed (constant rate) CLOCK_MONOTONIC_RAW if it
+  // is available.
+  struct timespec ts = { 0 };
+  ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+  tv->tv_sec = ts.tv_sec;
+  tv->tv_usec = ts.tv_nsec / 1000;
+#elif _POSIX_MONOTONIC_CLOCK
+  struct timespec ts = { 0 };
+  ret = clock_gettime(CLOCK_MONOTONIC, &ts);
+  tv->tv_sec = ts.tv_sec;
+  tv->tv_usec = ts.tv_nsec / 1000;
+#elif _WIN32
+  LARGE_INTEGER counts, countsPerSecond, countsPerMicrosecond;
+  if (QueryPerformanceFrequency(&countsPerSecond) &&
+      QueryPerformanceCounter(&counts)) {
+    countsPerMicrosecond.QuadPart = countsPerSecond.QuadPart / 1000000;
+    tv->tv_sec = (long)(counts.QuadPart / countsPerSecond.QuadPart);
+    tv->tv_usec = (long)((counts.QuadPart % countsPerSecond.QuadPart) /
+        countsPerMicrosecond.QuadPart);
+    ret = 0;
+  } else {
+    ret = gettimeofday(tv, NULL);
+  }
+#else
+  ret = gettimeofday(tv, NULL);
+#endif
+  if (ret) {
+    abort();
+  }
 }
 
 const void *zoo_get_context(zhandle_t *zh)
@@ -417,11 +521,13 @@ static void destroy(zhandle_t *zh)
     destroy_zk_hashtable(zh->active_node_watchers);
     destroy_zk_hashtable(zh->active_exist_watchers);
     destroy_zk_hashtable(zh->active_child_watchers);
+    addrvec_free(&zh->addrs_old);
+    addrvec_free(&zh->addrs_new);
 }
 
 static void setup_random()
 {
-#ifndef WIN32          // TODO: better seed
+#ifndef _WIN32          // TODO: better seed
     int seed;
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd == -1) {
@@ -634,7 +740,7 @@ static int resolve_hosts(const zhandle_t *zh, const char *hosts_in, addrvec_t *a
 #endif
             if (rc != 0) {
                 errno = getaddrinfo_errno(rc);
-#ifdef WIN32
+#ifdef _WIN32
                 LOG_ERROR(LOGCALLBACK(zh), "Win32 message: %s\n", gai_strerror(rc));
 #elif __linux__ && __GNUC__
                 LOG_ERROR(LOGCALLBACK(zh), "getaddrinfo: %s\n", gai_strerror(rc));
@@ -973,7 +1079,7 @@ static zhandle_t *zookeeper_init_internal(const char *host, watcher_fn watcher,
     zh->log_callback = log_callback;
     log_env(zh);
 
-#ifdef WIN32
+#ifdef _WIN32
     if (Win32WSAStartup()){
         LOG_ERROR(LOGCALLBACK(zh), "Error initializing ws2_32.dll");
         return 0;
@@ -995,6 +1101,9 @@ static zhandle_t *zookeeper_init_internal(const char *host, watcher_fn watcher,
     zh->state = ZOO_NOTCONNECTED_STATE;
     zh->context = context;
     zh->recv_timeout = recv_timeout;
+    zh->allow_read_only = flags & ZOO_READONLY;
+    // non-zero clientid implies we've seen r/w server already
+    zh->seen_rw_server_before = (clientid != 0 && clientid->client_id != 0);
     init_auth_info(&zh->auth_h);
     if (watcher) {
        zh->watcher = watcher;
@@ -1037,11 +1146,13 @@ static zhandle_t *zookeeper_init_internal(const char *host, watcher_fn watcher,
     if(update_addrs(zh) != 0) {
         goto abort;
     }
+
     if (clientid) {
         memcpy(&zh->client_id, clientid, sizeof(zh->client_id));
     } else {
         memset(&zh->client_id, 0, sizeof(zh->client_id));
     }
+    zh->io_count = 0;
     zh->primer_buffer.buffer = zh->primer_storage_buffer;
     zh->primer_buffer.curr_offset = 0;
     zh->primer_buffer.len = sizeof(zh->primer_storage_buffer);
@@ -1365,11 +1476,7 @@ static __attribute__ ((unused)) int get_queue_len(buffer_head_t *list)
  * 0 if send would block while sending the buffer (or a send was incomplete),
  * 1 if success
  */
-#ifdef WIN32
-static int send_buffer(SOCKET fd, buffer_list_t *buff)
-#else
-static int send_buffer(int fd, buffer_list_t *buff)
-#endif
+static int send_buffer(socket_t fd, buffer_list_t *buff)
 {
     int len = buff->len;
     int off = buff->curr_offset;
@@ -1381,10 +1488,10 @@ static int send_buffer(int fd, buffer_list_t *buff)
         char *b = (char*)&nlen;
         rc = zookeeper_send(fd, b + off, sizeof(nlen) - off);
         if (rc == -1) {
-#ifndef _WINDOWS
-            if (errno != EAGAIN) {
-#else
+#ifdef _WIN32
             if (WSAGetLastError() != WSAEWOULDBLOCK) {
+#else
+            if (errno != EAGAIN) {
 #endif
                 return -1;
             } else {
@@ -1400,10 +1507,10 @@ static int send_buffer(int fd, buffer_list_t *buff)
         off -= sizeof(buff->len);
         rc = zookeeper_send(fd, buff->buffer + off, len - off);
         if (rc == -1) {
-#ifndef _WINDOWS
-            if (errno != EAGAIN) {
-#else
+#ifdef _WIN32
             if (WSAGetLastError() != WSAEWOULDBLOCK) {
+#else
+            if (errno != EAGAIN) {
 #endif
                 return -1;
             }
@@ -1419,29 +1526,23 @@ static int send_buffer(int fd, buffer_list_t *buff)
  * 0 if recv would block,
  * 1 if success
  */
-#ifdef WIN32
-static int recv_buffer(SOCKET fd, buffer_list_t *buff)
-#else
-static int recv_buffer(int fd, buffer_list_t *buff)
-#endif
+static int recv_buffer(zhandle_t *zh, buffer_list_t *buff)
 {
     int off = buff->curr_offset;
     int rc = 0;
-    //fprintf(LOGSTREAM, "rc = %d, off = %d, line %d\n", rc, off, __LINE__);
 
     /* if buffer is less than 4, we are reading in the length */
     if (off < 4) {
         char *buffer = (char*)&(buff->len);
-        rc = recv(fd, buffer+off, sizeof(int)-off, 0);
-        //fprintf(LOGSTREAM, "rc = %d, off = %d, line %d\n", rc, off, __LINE__);
-        switch(rc) {
+        rc = recv(zh->fd, buffer+off, sizeof(int)-off, 0);
+        switch (rc) {
         case 0:
             errno = EHOSTDOWN;
         case -1:
-#ifndef _WINDOWS
-            if (errno == EAGAIN) {
-#else
+#ifdef _WIN32
             if (WSAGetLastError() == WSAEWOULDBLOCK) {
+#else
+            if (errno == EAGAIN) {
 #endif
                 return 0;
             }
@@ -1459,15 +1560,21 @@ static int recv_buffer(int fd, buffer_list_t *buff)
         /* want off to now represent the offset into the buffer */
         off -= sizeof(buff->len);
 
-        rc = recv(fd, buff->buffer+off, buff->len-off, 0);
+        rc = recv(zh->fd, buff->buffer+off, buff->len-off, 0);
+
+        /* dirty hack to make new client work against old server
+         * old server sends 40 bytes to finish connection handshake,
+         * while we're expecting 41 (1 byte for read-only mode data) */
+        if (buff == &zh->primer_buffer && rc == buff->len - 1) ++rc;
+
         switch(rc) {
         case 0:
             errno = EHOSTDOWN;
         case -1:
-#ifndef _WINDOWS
-            if (errno == EAGAIN) {
-#else
+#ifdef _WIN32
             if (WSAGetLastError() == WSAEWOULDBLOCK) {
+#else
+            if (errno == EAGAIN) {
 #endif
                 break;
             }
@@ -1561,6 +1668,13 @@ static void cleanup_bufs(zhandle_t *zh,int callCompletion,int rc)
     }
 }
 
+/* return 1 if zh's state is ZOO_CONNECTED_STATE or ZOO_READONLY_STATE,
+ * 0 otherwise */
+static int is_connected(zhandle_t* zh)
+{
+    return (zh->state==ZOO_CONNECTED_STATE || zh->state==ZOO_READONLY_STATE);
+}
+
 static void handle_error(zhandle_t *zh,int rc)
 {
     close(zh->fd);
@@ -1568,7 +1682,7 @@ static void handle_error(zhandle_t *zh,int rc)
         LOG_DEBUG(LOGCALLBACK(zh), "Calling a watcher for a ZOO_SESSION_EVENT and the state=%s",
                 state2String(zh->state));
         PROCESS_SESSION_EVENT(zh, zh->state);
-    } else if (zh->state == ZOO_CONNECTED_STATE) {
+    } else if (is_connected(zh)) {
         LOG_DEBUG(LOGCALLBACK(zh), "Calling a watcher for a ZOO_SESSION_EVENT and the state=CONNECTING_STATE");
         PROCESS_SESSION_EVENT(zh, ZOO_CONNECTING_STATE);
     }
@@ -1759,7 +1873,7 @@ static int serialize_prime_connect(struct connect_req *req, char* buffer){
     memcpy(buffer + offset, &req->protocolVersion, sizeof(req->protocolVersion));
     offset = offset +  sizeof(req->protocolVersion);
 
-    req->lastZxidSeen = htonll(req->lastZxidSeen);
+    req->lastZxidSeen = zoo_htonll(req->lastZxidSeen);
     memcpy(buffer + offset, &req->lastZxidSeen, sizeof(req->lastZxidSeen));
     offset = offset +  sizeof(req->lastZxidSeen);
 
@@ -1767,7 +1881,7 @@ static int serialize_prime_connect(struct connect_req *req, char* buffer){
     memcpy(buffer + offset, &req->timeOut, sizeof(req->timeOut));
     offset = offset +  sizeof(req->timeOut);
 
-    req->sessionId = htonll(req->sessionId);
+    req->sessionId = zoo_htonll(req->sessionId);
     memcpy(buffer + offset, &req->sessionId, sizeof(req->sessionId));
     offset = offset +  sizeof(req->sessionId);
 
@@ -1776,36 +1890,46 @@ static int serialize_prime_connect(struct connect_req *req, char* buffer){
     offset = offset +  sizeof(req->passwd_len);
 
     memcpy(buffer + offset, req->passwd, sizeof(req->passwd));
+    offset = offset +  sizeof(req->passwd);
+
+    memcpy(buffer + offset, &req->readOnly, sizeof(req->readOnly));
 
     return 0;
 }
 
- static int deserialize_prime_response(struct prime_struct *req, char* buffer){
+static int deserialize_prime_response(struct prime_struct *resp, char* buffer)
+{
      //this should be the order of deserialization
      int offset = 0;
-     memcpy(&req->len, buffer + offset, sizeof(req->len));
-     offset = offset +  sizeof(req->len);
+     memcpy(&resp->len, buffer + offset, sizeof(resp->len));
+     offset = offset +  sizeof(resp->len);
 
-     req->len = ntohl(req->len);
-     memcpy(&req->protocolVersion, buffer + offset, sizeof(req->protocolVersion));
-     offset = offset +  sizeof(req->protocolVersion);
+     resp->len = ntohl(resp->len);
+     memcpy(&resp->protocolVersion,
+            buffer + offset,
+            sizeof(resp->protocolVersion));
+     offset = offset +  sizeof(resp->protocolVersion);
 
-     req->protocolVersion = ntohl(req->protocolVersion);
-     memcpy(&req->timeOut, buffer + offset, sizeof(req->timeOut));
-     offset = offset +  sizeof(req->timeOut);
+     resp->protocolVersion = ntohl(resp->protocolVersion);
+     memcpy(&resp->timeOut, buffer + offset, sizeof(resp->timeOut));
+     offset = offset +  sizeof(resp->timeOut);
 
-     req->timeOut = ntohl(req->timeOut);
-     memcpy(&req->sessionId, buffer + offset, sizeof(req->sessionId));
-     offset = offset +  sizeof(req->sessionId);
+     resp->timeOut = ntohl(resp->timeOut);
+     memcpy(&resp->sessionId, buffer + offset, sizeof(resp->sessionId));
+     offset = offset +  sizeof(resp->sessionId);
 
-     req->sessionId = htonll(req->sessionId);
-     memcpy(&req->passwd_len, buffer + offset, sizeof(req->passwd_len));
-     offset = offset +  sizeof(req->passwd_len);
+     resp->sessionId = zoo_htonll(resp->sessionId);
+     memcpy(&resp->passwd_len, buffer + offset, sizeof(resp->passwd_len));
+     offset = offset +  sizeof(resp->passwd_len);
 
-     req->passwd_len = ntohl(req->passwd_len);
-     memcpy(req->passwd, buffer + offset, sizeof(req->passwd));
+     resp->passwd_len = ntohl(resp->passwd_len);
+     memcpy(resp->passwd, buffer + offset, sizeof(resp->passwd));
+     offset = offset +  sizeof(resp->passwd);
+
+     memcpy(&resp->readOnly, buffer + offset, sizeof(resp->readOnly));
+
      return 0;
- }
+}
 
 static int prime_connection(zhandle_t *zh)
 {
@@ -1816,11 +1940,12 @@ static int prime_connection(zhandle_t *zh)
     int hlen = 0;
     struct connect_req req;
     req.protocolVersion = 0;
-    req.sessionId = zh->client_id.client_id;
+    req.sessionId = zh->seen_rw_server_before ? zh->client_id.client_id : 0;
     req.passwd_len = sizeof(req.passwd);
     memcpy(req.passwd, zh->client_id.passwd, sizeof(zh->client_id.passwd));
     req.timeOut = zh->recv_timeout;
     req.lastZxidSeen = zh->last_zxid;
+    req.readOnly = zh->allow_read_only;
     hlen = htonl(len);
     /* We are running fast and loose here, but this string should fit in the initial buffer! */
     rc=zookeeper_send(zh->fd, &hlen, sizeof(len));
@@ -1833,6 +1958,8 @@ static int prime_connection(zhandle_t *zh)
     zh->state = ZOO_ASSOCIATING_STATE;
 
     zh->input_buffer = &zh->primer_buffer;
+    memset(zh->input_buffer->buffer, 0, zh->input_buffer->len);
+
     /* This seems a bit weird to to set the offset to 4, but we already have a
      * length, so we skip reading the length (and allocating the buffer) by
      * saying that we are already at offset 4 */
@@ -1879,7 +2006,7 @@ static struct timeval get_timeval(int interval)
 
     rc = serialize_RequestHeader(oa, "header", &h);
     enter_critical(zh);
-    gettimeofday(&zh->last_ping, 0);
+    get_system_time(&zh->last_ping);
     rc = rc < 0 ? rc : add_void_completion(zh, h.xid, 0, 0);
     rc = rc < 0 ? rc : queue_buffer_bytes(&zh->to_send, get_buffer(oa),
             get_buffer_len(oa));
@@ -1888,23 +2015,146 @@ static struct timeval get_timeval(int interval)
     return rc<0 ? rc : adaptor_send_queue(zh, 0);
 }
 
-#ifdef WIN32
-int zookeeper_interest(zhandle_t *zh, SOCKET *fd, int *interest,
-     struct timeval *tv)
+/* upper bound of a timeout for seeking for r/w server when in read-only mode */
+const int MAX_RW_TIMEOUT = 60000;
+const int MIN_RW_TIMEOUT = 200;
+
+static int ping_rw_server(zhandle_t* zh)
 {
+    char buf[10];
+    socket_t sock;
+    int rc;
+    sendsize_t ssize;
+    struct sockaddr_storage addr;
+
+    addrvec_peek(&zh->addrs, &addr);
+
+    sock = socket(addr.ss_family, SOCK_STREAM, 0);
+    if (sock < 0) {
+        return 0;
+    }
+
+    zookeeper_set_sock_nodelay(zh, sock);
+    zookeeper_set_sock_timeout(zh, sock, 1);
+
+    rc = zookeeper_connect(zh, &addr, sock);
+    if (rc < 0) {
+        return 0;
+    }
+
+    ssize = zookeeper_send(sock, "isro", 4);
+    if (ssize < 0) {
+        rc = 0;
+        goto out;
+    }
+
+    memset(buf, 0, sizeof(buf));
+    rc = recv(sock, buf, sizeof(buf), 0);
+    if (rc < 0) {
+        rc = 0;
+        goto out;
+    }
+
+    rc = strcmp("rw", buf) == 0;
+
+out:
+    close(sock);
+    return rc;
+}
+
+static inline int min(int a, int b)
+{
+    return a < b ? a : b;
+}
+
+static void zookeeper_set_sock_noblock(zhandle_t *zh, socket_t sock)
+{
+#ifdef _WIN32
     ULONG nonblocking_flag = 1;
+
+    ioctlsocket(sock, FIONBIO, &nonblocking_flag);
 #else
-int zookeeper_interest(zhandle_t *zh, int *fd, int *interest,
+    fcntl(sock, F_SETFL, O_NONBLOCK|fcntl(sock, F_GETFL, 0));
+#endif
+}
+
+static void zookeeper_set_sock_timeout(zhandle_t *zh, socket_t s, int timeout)
+{
+    struct timeval tv;
+
+    tv.tv_sec = timeout;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(struct timeval));
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(struct timeval));
+}
+
+static void zookeeper_set_sock_nodelay(zhandle_t *zh, socket_t sock)
+{
+#ifdef _WIN32
+    char enable_tcp_nodelay = 1;
+#else
+    int enable_tcp_nodelay = 1;
+#endif
+    int rc;
+
+    rc = setsockopt(sock,
+                    IPPROTO_TCP,
+                    TCP_NODELAY,
+                    &enable_tcp_nodelay,
+                    sizeof(enable_tcp_nodelay));
+
+    if (rc) {
+        LOG_WARN(LOGCALLBACK(zh),
+                 "Unable to set TCP_NODELAY, latency may be effected");
+    }
+}
+
+static socket_t zookeeper_connect(zhandle_t *zh,
+                                  struct sockaddr_storage *addr,
+                                  socket_t fd)
+{
+    int rc;
+    int addr_len;
+
+#if defined(AF_INET6)
+    if (addr->ss_family == AF_INET6) {
+        addr_len = sizeof(struct sockaddr_in6);
+    } else {
+        addr_len = sizeof(struct sockaddr_in);
+    }
+#else
+    addr_len = sizeof(struct sockaddr_in);
+#endif
+
+    LOG_DEBUG(LOGCALLBACK(zh), "[zk] connect()\n");
+    rc = connect(fd, (struct sockaddr *)addr, addr_len);
+
+#ifdef _WIN32
+    get_errno();
+#if _MSC_VER >= 1600
+    switch(errno) {
+    case WSAEWOULDBLOCK:
+        errno = EWOULDBLOCK;
+        break;
+    case WSAEINPROGRESS:
+        errno = EINPROGRESS;
+        break;
+    }
+#endif
+#endif
+
+    return rc;
+}
+
+int zookeeper_interest(zhandle_t *zh, socket_t *fd, int *interest,
      struct timeval *tv)
 {
-#endif
     int rc = 0;
     struct timeval now;
     if(zh==0 || fd==0 ||interest==0 || tv==0)
         return ZBADARGUMENTS;
     if (is_unrecoverable(zh))
         return ZINVALIDSTATE;
-    gettimeofday(&now, 0);
+    get_system_time(&now);
     if(zh->next_deadline.tv_sec!=0 || zh->next_deadline.tv_usec!=0){
         int time_left = calculate_interval(&zh->next_deadline, &now);
         int max_exceed = zh->recv_timeout / 10 > 200 ? 200 :
@@ -1925,7 +2175,6 @@ int zookeeper_interest(zhandle_t *zh, int *fd, int *interest,
     tv->tv_usec = 0;
 
     if (*fd == -1) {
-
         /*
          * If we previously failed to connect to server pool (zh->delay == 1)
          * then we need delay our connection on this iteration 1/60 of the
@@ -1940,63 +2189,45 @@ int zookeeper_interest(zhandle_t *zh, int *fd, int *interest,
 
             LOG_WARN(LOGCALLBACK(zh), "Delaying connection after exhaustively trying all servers [%s]",
                      zh->hostname);
-        }
-
-        // No need to delay -- grab the next server and attempt connection
-        else {
-            int ssoresult;
-
-#ifdef WIN32
-            char enable_tcp_nodelay = 1;
-#else
-            int enable_tcp_nodelay = 1;
-#endif
+        } else {
+            // No need to delay -- grab the next server and attempt connection
             zoo_cycle_next_server(zh);
-
             zh->fd = socket(zh->addr_cur.ss_family, SOCK_STREAM, 0);
             if (zh->fd < 0) {
-                return api_epilog(zh,handle_socket_error_msg(zh,__LINE__,
-                                                             ZSYSTEMERROR, "socket() call failed"));
+              rc = handle_socket_error_msg(zh,
+                                           __LINE__,
+                                           ZSYSTEMERROR,
+                                           "socket() call failed");
+              return api_epilog(zh, rc);
             }
-            ssoresult = setsockopt(zh->fd, IPPROTO_TCP, TCP_NODELAY, &enable_tcp_nodelay, sizeof(enable_tcp_nodelay));
-            if (ssoresult != 0) {
-                LOG_WARN(LOGCALLBACK(zh), "Unable to set TCP_NODELAY, operation latency may be effected");
-            }
-#ifdef WIN32
-            ioctlsocket(zh->fd, FIONBIO, &nonblocking_flag);
-#else
-            fcntl(zh->fd, F_SETFL, O_NONBLOCK|fcntl(zh->fd, F_GETFL, 0));
-#endif
-#if defined(AF_INET6)
-            if (zh->addr_cur.ss_family == AF_INET6) {
-                rc = connect(zh->fd, (struct sockaddr*)&zh->addr_cur, sizeof(struct sockaddr_in6));
-            } else {
-#else
-               LOG_DEBUG(LOGCALLBACK(zh), "[zk] connect()\n");
-            {
-#endif
-                rc = connect(zh->fd, (struct sockaddr*)&zh->addr_cur, sizeof(struct sockaddr_in));
-#ifdef WIN32
-                get_errno();
-#endif
-            }
-            if (rc == -1) {
 
+            zookeeper_set_sock_nodelay(zh, zh->fd);
+            zookeeper_set_sock_noblock(zh, zh->fd);
+
+            rc = zookeeper_connect(zh, &zh->addr_cur, zh->fd);
+
+            if (rc == -1) {
                 /* we are handling the non-blocking connect according to
                  * the description in section 16.3 "Non-blocking connect"
                  * in UNIX Network Programming vol 1, 3rd edition */
-                if (errno == EWOULDBLOCK || errno == EINPROGRESS)
+                if (errno == EWOULDBLOCK || errno == EINPROGRESS) {
                     zh->state = ZOO_CONNECTING_STATE;
-                else
-                {
-                    return api_epilog(zh,handle_socket_error_msg(zh,__LINE__,
-                            ZCONNECTIONLOSS,"connect() call failed"));
+                } else {
+                    rc = handle_socket_error_msg(zh,
+                                                 __LINE__,
+                                                 ZCONNECTIONLOSS,
+                                                 "connect() call failed");
+                    return api_epilog(zh, rc);
                 }
             } else {
-                if((rc=prime_connection(zh))!=0)
+                rc = prime_connection(zh);
+                if (rc != 0) {
                     return api_epilog(zh,rc);
+                }
 
-                LOG_INFO(LOGCALLBACK(zh), "Initiated connection to server [%s]", format_endpoint_info(&zh->addr_cur));
+                LOG_INFO(LOGCALLBACK(zh),
+                         "Initiated connection to server [%s]",
+                         format_endpoint_info(&zh->addr_cur));
             }
             *tv = get_timeval(zh->recv_timeout/3);
         }
@@ -2004,6 +2235,8 @@ int zookeeper_interest(zhandle_t *zh, int *fd, int *interest,
         zh->last_recv = now;
         zh->last_send = now;
         zh->last_ping = now;
+        zh->last_ping_rw = now;
+        zh->ping_rw_timeout = MIN_RW_TIMEOUT;
     }
 
     if (zh->fd != -1) {
@@ -2014,7 +2247,7 @@ int zookeeper_interest(zhandle_t *zh, int *fd, int *interest,
         // have we exceeded the receive timeout threshold?
         if (recv_to <= 0) {
             // We gotta cut our losses and connect to someone else
-#ifdef WIN32
+#ifdef _WIN32
             errno = WSAETIMEDOUT;
 #else
             errno = ETIMEDOUT;
@@ -2028,23 +2261,49 @@ int zookeeper_interest(zhandle_t *zh, int *fd, int *interest,
                     -recv_to));
 
         }
+
         // We only allow 1/3 of our timeout time to expire before sending
         // a PING
-        if (zh->state==ZOO_CONNECTED_STATE) {
+        if (is_connected(zh)) {
             send_to = zh->recv_timeout/3 - idle_send;
-            if (send_to <= 0 && zh->sent_requests.head==0) {
-//                LOG_DEBUG(LOGCALLBACK(zh), "Sending PING to %s (exceeded idle by %dms)",
-//                                zoo_get_current_server(zh),-send_to);
-                rc = send_ping(zh);
-                if (rc < 0){
-                    LOG_ERROR(LOGCALLBACK(zh), "failed to send PING request (zk retcode=%d)",rc);
-                    return api_epilog(zh,rc);
+            if (send_to <= 0) {
+                if (zh->sent_requests.head == 0) {
+                    rc = send_ping(zh);
+                    if (rc < 0) {
+                        LOG_ERROR(LOGCALLBACK(zh), "failed to send PING request (zk retcode=%d)",rc);
+                        return api_epilog(zh,rc);
+                    }
                 }
                 send_to = zh->recv_timeout/3;
             }
         }
+
+        // If we are in read-only mode, seek for read/write server
+        if (zh->state == ZOO_READONLY_STATE) {
+            int idle_ping_rw = calculate_interval(&zh->last_ping_rw, &now);
+            if (idle_ping_rw >= zh->ping_rw_timeout) {
+                zh->last_ping_rw = now;
+                idle_ping_rw = 0;
+                zh->ping_rw_timeout = min(zh->ping_rw_timeout * 2,
+                                          MAX_RW_TIMEOUT);
+                if (ping_rw_server(zh)) {
+                    struct sockaddr_storage addr;
+                    addrvec_peek(&zh->addrs, &addr);
+                    zh->ping_rw_timeout = MIN_RW_TIMEOUT;
+                    LOG_INFO(LOGCALLBACK(zh),
+                             "r/w server found at %s",
+                             format_endpoint_info(&addr));
+                    handle_error(zh, ZRWSERVERFOUND);
+                } else {
+                    addrvec_next(&zh->addrs, NULL);
+                }
+            }
+            send_to = min(send_to, zh->ping_rw_timeout - idle_ping_rw);
+        }
+
         // choose the lesser value as the timeout
-        *tv = get_timeval(recv_to < send_to? recv_to:send_to);
+        *tv = get_timeval(min(recv_to, send_to));
+
         zh->next_deadline.tv_sec = now.tv_sec + tv->tv_sec;
         zh->next_deadline.tv_usec = now.tv_usec + tv->tv_usec;
         if (zh->next_deadline.tv_usec > 1000000) {
@@ -2054,7 +2313,7 @@ int zookeeper_interest(zhandle_t *zh, int *fd, int *interest,
         *interest = ZOOKEEPER_READ;
         /* we are interested in a write if we are connected and have something
          * to send, or we are waiting for a connect to finish. */
-        if ((zh->to_send.head && (zh->state == ZOO_CONNECTED_STATE))
+        if ((zh->to_send.head && is_connected(zh))
             || zh->state == ZOO_CONNECTING_STATE) {
             *interest |= ZOOKEEPER_WRITE;
         }
@@ -2099,22 +2358,23 @@ static int check_events(zhandle_t *zh, int events)
             zh->input_buffer = allocate_buffer(0,0);
         }
 
-        rc = recv_buffer(zh->fd, zh->input_buffer);
+        rc = recv_buffer(zh, zh->input_buffer);
         if (rc < 0) {
             return handle_socket_error_msg(zh, __LINE__,ZCONNECTIONLOSS,
                 "failed while receiving a server response");
         }
         if (rc > 0) {
-            gettimeofday(&zh->last_recv, 0);
+            get_system_time(&zh->last_recv);
             if (zh->input_buffer != &zh->primer_buffer) {
                 queue_buffer(&zh->to_process, zh->input_buffer, 0);
             } else  {
-                int64_t oldid,newid;
+                int64_t oldid, newid;
                 //deserialize
                 deserialize_prime_response(&zh->primer_storage, zh->primer_buffer.buffer);
                 /* We are processing the primer_buffer, so we need to finish
                  * the connection handshake */
-                oldid = zh->client_id.client_id;
+                oldid = zh->seen_rw_server_before ? zh->client_id.client_id : 0;
+                zh->seen_rw_server_before |= !zh->primer_storage.readOnly;
                 newid = zh->primer_storage.sessionId;
                 if (oldid != 0 && oldid != newid) {
                     zh->state = ZOO_EXPIRED_SESSION_STATE;
@@ -2127,11 +2387,14 @@ static int check_events(zhandle_t *zh, int events)
 
                     memcpy(zh->client_id.passwd, &zh->primer_storage.passwd,
                            sizeof(zh->client_id.passwd));
-                    zh->state = ZOO_CONNECTED_STATE;
+                    zh->state = zh->primer_storage.readOnly ?
+                      ZOO_READONLY_STATE : ZOO_CONNECTED_STATE;
                     zh->reconfig = 0;
-                    LOG_INFO(LOGCALLBACK(zh), "session establishment complete on server [%s], sessionId=%#llx, negotiated timeout=%d",
-                              format_endpoint_info(&zh->addr_cur),
-                              newid, zh->recv_timeout);
+                    LOG_INFO(LOGCALLBACK(zh),
+                             "session establishment complete on server [%s], sessionId=%#llx, negotiated timeout=%d %s",
+                             format_endpoint_info(&zh->addr_cur),
+                             newid, zh->recv_timeout,
+                             zh->primer_storage.readOnly ? "(READ-ONLY mode)" : "");
                     /* we want the auth to be sent for, but since both call push to front
                        we need to call send_watch_set first */
                     send_set_watches(zh);
@@ -2139,7 +2402,7 @@ static int check_events(zhandle_t *zh, int events)
                     send_auth_info(zh);
                     LOG_DEBUG(LOGCALLBACK(zh), "Calling a watcher for a ZOO_SESSION_EVENT and the state=ZOO_CONNECTED_STATE");
                     zh->input_buffer = 0; // just in case the watcher calls zookeeper_process() again
-                    PROCESS_SESSION_EVENT(zh, ZOO_CONNECTED_STATE);
+                    PROCESS_SESSION_EVENT(zh, zh->state);
                 }
             }
             zh->input_buffer = 0;
@@ -2536,7 +2799,7 @@ void process_completions(zhandle_t *zh)
 
 static void isSocketReadable(zhandle_t* zh)
 {
-#ifndef WIN32
+#ifndef _WIN32
     struct pollfd fds;
     fds.fd = zh->fd;
     fds.events = POLLIN;
@@ -2555,7 +2818,7 @@ static void isSocketReadable(zhandle_t* zh)
     }
 #endif
     else{
-        gettimeofday(&zh->socket_readable,0);
+        get_system_time(&zh->socket_readable);
     }
 }
 
@@ -2567,7 +2830,7 @@ static void checkResponseLatency(zhandle_t* zh)
     if(zh->socket_readable.tv_sec==0)
         return;
 
-    gettimeofday(&now,0);
+    get_system_time(&now);
     delay=calculate_interval(&zh->socket_readable, &now);
     if(delay>20)
         LOG_DEBUG(LOGCALLBACK(zh), "The following server response has spent at least %dms sitting in the client socket recv buffer",delay);
@@ -2643,6 +2906,7 @@ int zookeeper_process(zhandle_t *zh, int events)
             if (zh->close_requested == 1 && cptr == NULL) {
                 LOG_DEBUG(LOGCALLBACK(zh), "Completion queue has been cleared by zookeeper_close()");
                 close_buffer_iarchive(&ia);
+                free_buffer(bptr);
                 return api_epilog(zh,ZINVALIDSTATE);
             }
             assert(cptr);
@@ -2666,12 +2930,13 @@ int zookeeper_process(zhandle_t *zh, int events)
                 zh->last_zxid = hdr.zxid;
             }
             activateWatcher(zh, cptr->watcher, rc);
+            deactivateWatcher(zh, cptr->watcher_deregistration, rc);
 
             if (cptr->c.void_result != SYNCHRONOUS_MARKER) {
                 if(hdr.xid == PING_XID){
                     int elapsed = 0;
                     struct timeval now;
-                    gettimeofday(&now, 0);
+                    get_system_time(&now);
                     elapsed = calculate_interval(&zh->last_ping, &now);
                     LOG_DEBUG(LOGCALLBACK(zh), "Got ping response in %d ms", elapsed);
 
@@ -2704,7 +2969,9 @@ int zookeeper_process(zhandle_t *zh, int events)
     if (process_async(zh->outstanding_sync)) {
         process_completions(zh);
     }
-    return api_epilog(zh,ZOK);}
+
+    return api_epilog(zh, ZOK);
+}
 
 int zoo_state(zhandle_t *zh)
 {
@@ -2726,6 +2993,21 @@ static watcher_registration_t* create_watcher_registration(const char* path,
     return wo;
 }
 
+static watcher_deregistration_t* create_watcher_deregistration(const char* path,
+        watcher_fn watcher, void *watcherCtx, ZooWatcherType wtype) {
+    watcher_deregistration_t *wdo;
+
+    wdo = calloc(1, sizeof(watcher_deregistration_t));
+    if (!wdo) {
+      return NULL;
+    }
+    wdo->path = strdup(path);
+    wdo->watcher = watcher;
+    wdo->context = watcherCtx;
+    wdo->type = wtype;
+    return wdo;
+}
+
 static void destroy_watcher_registration(watcher_registration_t* wo){
     if(wo!=0){
         free((void*)wo->path);
@@ -2733,10 +3015,34 @@ static void destroy_watcher_registration(watcher_registration_t* wo){
     }
 }
 
+static void destroy_watcher_deregistration(watcher_deregistration_t *wdo) {
+    if (wdo) {
+        free((void *)wdo->path);
+        free(wdo);
+    }
+}
+
 static completion_list_t* create_completion_entry(zhandle_t *zh, int xid, int completion_type,
         const void *dc, const void *data,watcher_registration_t* wo, completion_head_t *clist)
 {
-    completion_list_t *c = calloc(1,sizeof(completion_list_t));
+    return do_create_completion_entry(zh, xid, completion_type, dc, data, wo,
+                                      clist, NULL);
+}
+
+static completion_list_t* create_completion_entry_deregistration(zhandle_t *zh,
+        int xid, int completion_type, const void *dc, const void *data,
+        watcher_deregistration_t* wdo, completion_head_t *clist)
+{
+    return do_create_completion_entry(zh, xid, completion_type, dc, data, NULL,
+                                      clist, wdo);
+}
+
+static completion_list_t* do_create_completion_entry(zhandle_t *zh, int xid,
+        int completion_type, const void *dc, const void *data,
+        watcher_registration_t* wo, completion_head_t *clist,
+        watcher_deregistration_t* wdo)
+{
+    completion_list_t *c = calloc(1, sizeof(completion_list_t));
     if (!c) {
         LOG_ERROR(LOGCALLBACK(zh), "out of memory");
         return 0;
@@ -2775,6 +3081,7 @@ static completion_list_t* create_completion_entry(zhandle_t *zh, int xid, int co
     }
     c->xid = xid;
     c->watcher = wo;
+    c->watcher_deregistration = wdo;
 
     return c;
 }
@@ -2782,6 +3089,7 @@ static completion_list_t* create_completion_entry(zhandle_t *zh, int xid, int co
 static void destroy_completion_entry(completion_list_t* c){
     if(c!=0){
         destroy_watcher_registration(c->watcher);
+        destroy_watcher_deregistration(c->watcher_deregistration);
         if(c->buffer!=0)
             free_buffer(c->buffer);
         free(c);
@@ -2827,6 +3135,21 @@ static int add_completion(zhandle_t *zh, int xid, int completion_type,
 {
     completion_list_t *c =create_completion_entry(zh, xid, completion_type, dc,
             data, wo, clist);
+    return do_add_completion(zh, dc, c, add_to_front);
+}
+
+static int add_completion_deregistration(zhandle_t *zh, int xid,
+        int completion_type, const void *dc, const void *data, int add_to_front,
+        watcher_deregistration_t* wdo, completion_head_t *clist)
+{
+    completion_list_t *c = create_completion_entry_deregistration(zh, xid,
+           completion_type, dc, data, wdo, clist);
+    return do_add_completion(zh, dc, c, add_to_front);
+}
+
+static int do_add_completion(zhandle_t *zh, const void *dc,
+        completion_list_t *c, int add_to_front)
+{
     int rc = 0;
     if (!c)
         return ZSYSTEMERROR;
@@ -2924,7 +3247,7 @@ int zookeeper_close(zhandle_t *zh)
     }
     /* No need to decrement the counter since we're just going to
      * destroy the handle later. */
-    if(zh->state==ZOO_CONNECTED_STATE){
+    if (is_connected(zh)){
         struct oarchive *oa;
         struct RequestHeader h = {get_xid(), ZOO_CLOSE_OP};
         LOG_INFO(LOGCALLBACK(zh), "Closing zookeeper sessionId=%#llx to [%s]\n",
@@ -2953,7 +3276,7 @@ finish:
     destroy(zh);
     adaptor_destroy(zh);
     free(zh);
-#ifdef WIN32
+#ifdef _WIN32
     Win32WSACleanup();
 #endif
     return rc;
@@ -3234,30 +3557,6 @@ static int CreateRequest_init(zhandle_t *zh, struct CreateRequest *req,
     return ZOK;
 }
 
-static int Create2Request_init(zhandle_t *zh, struct Create2Request *req,
-        const char *path, const char *value,
-        int valuelen, const struct ACL_vector *acl_entries, int flags)
-{
-    int rc;
-    assert(req);
-    rc = Request_path_init(zh, flags, &req->path, path);
-    assert(req);
-    if (rc != ZOK) {
-        return rc;
-    }
-    req->flags = flags;
-    req->data.buff = (char*)value;
-    req->data.len = valuelen;
-    if (acl_entries == 0) {
-        req->acl.count = 0;
-        req->acl.data = 0;
-    } else {
-        req->acl = *acl_entries;
-    }
-
-    return ZOK;
-}
-
 int zoo_acreate(zhandle_t *zh, const char *path, const char *value,
         int valuelen, const struct ACL_vector *acl_entries, int flags,
         string_completion_t completion, const void *data)
@@ -3296,15 +3595,15 @@ int zoo_acreate2(zhandle_t *zh, const char *path, const char *value,
 {
     struct oarchive *oa;
     struct RequestHeader h = { get_xid(), ZOO_CREATE2_OP };
-    struct Create2Request req;
+    struct CreateRequest req;
 
-    int rc = Create2Request_init(zh, &req, path, value, valuelen, acl_entries, flags);
+    int rc = CreateRequest_init(zh, &req, path, value, valuelen, acl_entries, flags);
     if (rc != ZOK) {
         return rc;
     }
     oa = create_buffer_oarchive();
     rc = serialize_RequestHeader(oa, "header", &h);
-    rc = rc < 0 ? rc : serialize_Create2Request(oa, "req", &req);
+    rc = rc < 0 ? rc : serialize_CreateRequest(oa, "req", &req);
     enter_critical(zh);
     rc = rc < 0 ? rc : add_string_stat_completion(zh, h.xid, completion, data);
     rc = rc < 0 ? rc : queue_buffer_bytes(&zh->to_send, get_buffer(oa),
@@ -3829,31 +4128,31 @@ int flush_send_queue(zhandle_t*zh, int timeout)
 {
     int rc= ZOK;
     struct timeval started;
-#ifdef WIN32
+#ifdef _WIN32
     fd_set pollSet;
     struct timeval wait;
 #endif
-    gettimeofday(&started,0);
+    get_system_time(&started);
     // we can't use dequeue_buffer() here because if (non-blocking) send_buffer()
     // returns EWOULDBLOCK we'd have to put the buffer back on the queue.
     // we use a recursive lock instead and only dequeue the buffer if a send was
     // successful
     lock_buffer_list(&zh->to_send);
-    while (zh->to_send.head != 0&& zh->state == ZOO_CONNECTED_STATE) {
+    while (zh->to_send.head != 0 && is_connected(zh)) {
         if(timeout!=0){
-#ifndef WIN32
+#ifndef _WIN32
             struct pollfd fds;
 #endif
             int elapsed;
             struct timeval now;
-            gettimeofday(&now,0);
+            get_system_time(&now);
             elapsed=calculate_interval(&started,&now);
             if (elapsed>timeout) {
                 rc = ZOPERATIONTIMEOUT;
                 break;
             }
 
-#ifdef WIN32
+#ifdef _WIN32
             wait = get_timeval(timeout-elapsed);
             FD_ZERO(&pollSet);
             FD_SET(zh->fd, &pollSet);
@@ -3885,7 +4184,7 @@ int flush_send_queue(zhandle_t*zh, int timeout)
         // if the buffer has been sent successfully, remove it from the queue
         if (rc > 0)
             remove_buffer(&zh->to_send);
-        gettimeofday(&zh->last_send, 0);
+        get_system_time(&zh->last_send);
         rc = ZOK;
     }
     unlock_buffer_list(&zh->to_send);
@@ -3943,6 +4242,8 @@ const char* zerror(int c)
       return "(not error) no server responses to process";
     case ZSESSIONMOVED:
       return "session moved to another server, so operation is ignored";
+    case ZNOTREADONLY:
+      return "state-changing request is passed to read-only server";
    case ZNEWCONFIGNOQUORUM:
        return "no quorum of new config is connected and up-to-date with the leader of last commmitted config - try invoking reconfiguration after new servers are connected and synced";
    case ZRECONFIGINPROGRESS:
@@ -3993,7 +4294,7 @@ int zoo_add_auth(zhandle_t *zh,const char* scheme,const char* cert,
     add_last_auth(&zh->auth_h, authinfo);
     zoo_unlock_auth(zh);
 
-    if(zh->state == ZOO_CONNECTED_STATE || zh->state == ZOO_ASSOCIATING_STATE)
+    if (is_connected(zh) || zh->state == ZOO_ASSOCIATING_STATE)
         return send_last_auth_info(zh);
 
     return ZOK;
@@ -4004,7 +4305,7 @@ static const char* format_endpoint_info(const struct sockaddr_storage* ep)
     static char buf[128] = { 0 };
     char addrstr[128] = { 0 };
     void *inaddr;
-#ifdef WIN32
+#ifdef _WIN32
     char * addrstring;
 #endif
     int port;
@@ -4022,7 +4323,7 @@ static const char* format_endpoint_info(const struct sockaddr_storage* ep)
 #if defined(AF_INET6)
     }
 #endif
-#ifdef WIN32
+#ifdef _WIN32
     addrstring = inet_ntoa (*(struct in_addr*)inaddr);
     sprintf(buf,"%s:%d",addrstring,ntohs(port));
 #else
@@ -4368,5 +4669,96 @@ int zoo_set_acl(zhandle_t *zh, const char *path, int version,
         rc = sc->rc;
     }
     free_sync_completion(sc);
+    return rc;
+}
+
+int zoo_remove_watchers(zhandle_t *zh, const char *path, ZooWatcherType wtype,
+         watcher_fn watcher, void *watcherCtx, int local)
+{
+    struct sync_completion *sc;
+    int rc = 0;
+
+    if (!path)
+        return ZBADARGUMENTS;
+
+    sc = alloc_sync_completion();
+    if (!sc)
+        return ZSYSTEMERROR;
+
+    rc = zoo_aremove_watchers(zh, path, wtype, watcher, watcherCtx, local,
+                              SYNCHRONOUS_MARKER, sc);
+    if (rc == ZOK) {
+        wait_sync_completion(sc);
+        rc = sc->rc;
+    }
+    free_sync_completion(sc);
+    return rc;
+}
+
+int zoo_aremove_watchers(zhandle_t *zh, const char *path, ZooWatcherType wtype,
+        watcher_fn watcher, void *watcherCtx, int local,
+        void_completion_t *completion, const void *data)
+{
+    char *server_path = prepend_string(zh, path);
+    int rc;
+    struct oarchive *oa;
+    struct RequestHeader h = { get_xid(), ZOO_REMOVE_WATCHES };
+    struct RemoveWatchesRequest req =  { (char*)server_path, wtype };
+    watcher_deregistration_t *wdo;
+
+    if (!zh || !isValidPath(server_path, 0)) {
+        rc = ZBADARGUMENTS;
+        goto done;
+    }
+
+    if (!local && is_unrecoverable(zh)) {
+        rc = ZINVALIDSTATE;
+        goto done;
+    }
+
+    if (!pathHasWatcher(zh, server_path, wtype, watcher, watcherCtx)) {
+        rc = ZNOWATCHER;
+        goto done;
+    }
+
+    if (local) {
+        removeWatchers(zh, server_path, wtype, watcher, watcherCtx);
+        notify_sync_completion((struct sync_completion *)data);
+        rc = ZOK;
+        goto done;
+    }
+
+    oa = create_buffer_oarchive();
+    rc = serialize_RequestHeader(oa, "header", &h);
+    rc = rc < 0 ? rc : serialize_RemoveWatchesRequest(oa, "req", &req);
+    if (rc < 0) {
+        goto done;
+    }
+
+    wdo = create_watcher_deregistration(server_path, watcher, watcherCtx,
+                                        wtype);
+    if (!wdo) {
+        rc = ZSYSTEMERROR;
+        goto done;
+    }
+
+    enter_critical(zh);
+    rc = add_completion_deregistration(zh, h.xid, COMPLETION_VOID,
+                                       completion, data, 0, wdo, 0);
+    rc = rc < 0 ? rc : queue_buffer_bytes(&zh->to_send, get_buffer(oa),
+            get_buffer_len(oa));
+    rc = rc < 0 ? ZMARSHALLINGERROR : ZOK;
+    leave_critical(zh);
+
+    /* We queued the buffer, so don't free it */
+    close_buffer_oarchive(&oa, 0);
+
+    LOG_DEBUG(LOGCALLBACK(zh), "Sending request xid=%#x for path [%s] to %s",
+              h.xid, path, zoo_get_current_server(zh));
+
+    adaptor_send_queue(zh, 0);
+
+done:
+    free_duplicate_path(server_path, path);
     return rc;
 }

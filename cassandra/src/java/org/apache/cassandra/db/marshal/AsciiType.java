@@ -18,25 +18,77 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.Charset;
+import java.nio.charset.CharsetEncoder;
+import java.nio.charset.CharacterCodingException;
+
+import org.apache.cassandra.cql3.Constants;
+import org.apache.cassandra.cql3.Json;
 
 import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.Term;
+import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.AsciiSerializer;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class AsciiType extends AbstractType<String>
 {
     public static final AsciiType instance = new AsciiType();
 
-    AsciiType() {} // singleton
+    AsciiType() {super(ComparisonType.BYTE_ORDER);} // singleton
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    private final ThreadLocal<CharsetEncoder> encoder = new ThreadLocal<CharsetEncoder>()
     {
-        return BytesType.bytesCompare(o1, o2);
-    }
+        @Override
+        protected CharsetEncoder initialValue()
+        {
+            return Charset.forName("US-ASCII").newEncoder();
+        }
+    };
 
     public ByteBuffer fromString(String source)
     {
-        return decompose(source);
+        // the encoder must be reset each time it's used, hence the thread-local storage
+        CharsetEncoder theEncoder = encoder.get();
+        theEncoder.reset();
+
+        try
+        {
+            return theEncoder.encode(CharBuffer.wrap(source));
+        }
+        catch (CharacterCodingException exc)
+        {
+            throw new MarshalException(String.format("Invalid ASCII character in string literal: %s", exc));
+        }
+    }
+
+    @Override
+    public Term fromJSONObject(Object parsed) throws MarshalException
+    {
+        try
+        {
+            return new Constants.Value(fromString((String) parsed));
+        }
+        catch (ClassCastException exc)
+        {
+            throw new MarshalException(String.format(
+                    "Expected an ascii string, but got a %s: %s", parsed.getClass().getSimpleName(), parsed));
+        }
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    {
+        try
+        {
+            return '"' + new String(Json.JSON_STRING_ENCODER.quoteAsString(ByteBufferUtil.string(buffer, Charset.forName("US-ASCII")))) + '"';
+        }
+        catch (CharacterCodingException exc)
+        {
+            throw new AssertionError("ascii value contained non-ascii characters: ", exc);
+        }
     }
 
     public CQL3Type asCQL3Type()

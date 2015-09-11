@@ -127,12 +127,6 @@ module org.apache.zookeeper.proto {
         vector<org.apache.zookeeper.data.ACL> acl;
         int flags;
     }
-    class Create2Request {
-        ustring path;
-        buffer data;
-        vector<org.apache.zookeeper.data.ACL> acl;
-        int flags;
-    }
     class DeleteRequest {
         ustring path;
         int version;
@@ -213,6 +207,14 @@ module org.apache.zookeeper.proto {
         vector<org.apache.zookeeper.data.ACL> acl;
         org.apache.zookeeper.data.Stat stat;
     }
+    class CheckWatchesRequest {
+        ustring path;
+        int type;
+    }
+    class RemoveWatchesRequest {
+        ustring path;
+        int type;
+    }
 }
 
 module org.apache.zookeeper.server.quorum {
@@ -256,6 +258,12 @@ module org.apache.zookeeper.txn {
         buffer data;
         vector<org.apache.zookeeper.data.ACL> acl;
         boolean ephemeral;
+        int parentCVersion;
+    }
+    class CreateContainerTxn {
+        ustring path;
+        buffer data;
+        vector<org.apache.zookeeper.data.ACL> acl;
         int parentCVersion;
     }
     class DeleteTxn {

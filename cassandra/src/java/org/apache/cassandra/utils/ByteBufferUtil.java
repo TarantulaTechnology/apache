@@ -28,9 +28,14 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.UUID;
 
+import net.nicoulaj.compilecommand.annotations.Inline;
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.FileUtils;
 
@@ -74,42 +79,26 @@ import org.apache.cassandra.io.util.FileUtils;
  */
 public class ByteBufferUtil
 {
-    private static final Charset UTF_8 = Charset.forName("UTF-8");
     public static final ByteBuffer EMPTY_BYTE_BUFFER = ByteBuffer.wrap(new byte[0]);
+    /** Represents an unset value in bound variables */
+    public static final ByteBuffer UNSET_BYTE_BUFFER = ByteBuffer.wrap(new byte[]{});
 
+    @Inline
     public static int compareUnsigned(ByteBuffer o1, ByteBuffer o2)
     {
-        assert o1 != null;
-        assert o2 != null;
-        if (o1 == o2)
-            return 0;
-
-        if (o1.hasArray() && o2.hasArray())
-        {
-            return FBUtilities.compareUnsigned(o1.array(), o2.array(), o1.position() + o1.arrayOffset(),
-                    o2.position() + o2.arrayOffset(), o1.remaining(), o2.remaining());
-        }
-
-        int end1 = o1.position() + o1.remaining();
-        int end2 = o2.position() + o2.remaining();
-        for (int i = o1.position(), j = o2.position(); i < end1 && j < end2; i++, j++)
-        {
-            int a = (o1.get(i) & 0xff);
-            int b = (o2.get(j) & 0xff);
-            if (a != b)
-                return a - b;
-        }
-        return o1.remaining() - o2.remaining();
+        return FastByteOperations.compareUnsigned(o1, o2);
     }
 
+    @Inline
     public static int compare(byte[] o1, ByteBuffer o2)
     {
-        return compareUnsigned(ByteBuffer.wrap(o1), o2);
+        return FastByteOperations.compareUnsigned(o1, 0, o1.length, o2);
     }
 
+    @Inline
     public static int compare(ByteBuffer o1, byte[] o2)
     {
-        return compareUnsigned(o1, ByteBuffer.wrap(o2));
+        return FastByteOperations.compareUnsigned(o1, o2, 0, o2.length);
     }
 
     /**
@@ -121,7 +110,7 @@ public class ByteBufferUtil
      */
     public static String string(ByteBuffer buffer) throws CharacterCodingException
     {
-        return string(buffer, UTF_8);
+        return string(buffer, StandardCharsets.UTF_8);
     }
 
     /**
@@ -135,7 +124,7 @@ public class ByteBufferUtil
      */
     public static String string(ByteBuffer buffer, int position, int length) throws CharacterCodingException
     {
-        return string(buffer, position, length, UTF_8);
+        return string(buffer, position, length, StandardCharsets.UTF_8);
     }
 
     /**
@@ -173,14 +162,10 @@ public class ByteBufferUtil
     public static byte[] getArray(ByteBuffer buffer)
     {
         int length = buffer.remaining();
-
         if (buffer.hasArray())
         {
             int boff = buffer.arrayOffset() + buffer.position();
-            if (boff == 0 && length == buffer.array().length)
-                return buffer.array();
-            else
-                return Arrays.copyOfRange(buffer.array(), boff, boff + length);
+            return Arrays.copyOfRange(buffer.array(), boff, boff + length);
         }
         // else, DirectByteBuffer.get() is the fastest route
         byte[] bytes = new byte[length];
@@ -190,7 +175,7 @@ public class ByteBufferUtil
     }
 
     /**
-     * ByteBuffer adaptation of org.apache.commons.lang.ArrayUtils.lastIndexOf method
+     * ByteBuffer adaptation of org.apache.commons.lang3.ArrayUtils.lastIndexOf method
      *
      * @param buffer the array to traverse for looking for the object, may be <code>null</code>
      * @param valueToFind the value to find
@@ -228,7 +213,7 @@ public class ByteBufferUtil
      */
     public static ByteBuffer bytes(String s)
     {
-        return ByteBuffer.wrap(s.getBytes(UTF_8));
+        return ByteBuffer.wrap(s.getBytes(StandardCharsets.UTF_8));
     }
 
     /**
@@ -270,12 +255,9 @@ public class ByteBufferUtil
         return clone;
     }
 
-    public static void arrayCopy(ByteBuffer buffer, int position, byte[] bytes, int offset, int length)
+    public static void arrayCopy(ByteBuffer src, int srcPos, byte[] dst, int dstPos, int length)
     {
-        if (buffer.hasArray())
-            System.arraycopy(buffer.array(), buffer.arrayOffset() + position, bytes, offset, length);
-        else
-            ((ByteBuffer) buffer.duplicate().position(position)).get(bytes, offset, length);
+        FastByteOperations.copy(src, srcPos, dst, dstPos, length);
     }
 
     /**
@@ -290,29 +272,28 @@ public class ByteBufferUtil
      */
     public static void arrayCopy(ByteBuffer src, int srcPos, ByteBuffer dst, int dstPos, int length)
     {
-        if (src.hasArray() && dst.hasArray())
-        {
-            System.arraycopy(src.array(),
-                             src.arrayOffset() + srcPos,
-                             dst.array(),
-                             dst.arrayOffset() + dstPos,
-                             length);
-        }
-        else
-        {
-            if (src.limit() - srcPos < length || dst.limit() - dstPos < length)
-                throw new IndexOutOfBoundsException();
-
-            for (int i = 0; i < length; i++)
-                // TODO: ByteBuffer.put is polymorphic, and might be slow here
-                dst.put(dstPos++, src.get(srcPos++));
-        }
+        FastByteOperations.copy(src, srcPos, dst, dstPos, length);
     }
 
-    public static void writeWithLength(ByteBuffer bytes, DataOutput out) throws IOException
+    public static int put(ByteBuffer src, ByteBuffer trg)
+    {
+        int length = Math.min(src.remaining(), trg.remaining());
+        arrayCopy(src, src.position(), trg, trg.position(), length);
+        trg.position(trg.position() + length);
+        src.position(src.position() + length);
+        return length;
+    }
+
+    public static void writeWithLength(ByteBuffer bytes, DataOutputPlus out) throws IOException
     {
         out.writeInt(bytes.remaining());
-        write(bytes, out); // writing data bytes to output source
+        out.write(bytes);
+    }
+
+    public static void writeWithVIntLength(ByteBuffer bytes, DataOutputPlus out) throws IOException
+    {
+        out.writeVInt(bytes.remaining());
+        out.write(bytes);
     }
 
     public static void writeWithLength(byte[] bytes, DataOutput out) throws IOException
@@ -321,27 +302,20 @@ public class ByteBufferUtil
         out.write(bytes);
     }
 
-    public static void write(ByteBuffer buffer, DataOutput out) throws IOException
-    {
-        if (buffer.hasArray())
-        {
-            out.write(buffer.array(), buffer.arrayOffset() + buffer.position(), buffer.remaining());
-        }
-        else
-        {
-            for (int i = buffer.position(); i < buffer.limit(); i++)
-            {
-                out.writeByte(buffer.get(i));
-            }
-        }
-    }
-
-    public static void writeWithShortLength(ByteBuffer buffer, DataOutput out) throws IOException
+    public static void writeWithShortLength(ByteBuffer buffer, DataOutputPlus out) throws IOException
     {
         int length = buffer.remaining();
         assert 0 <= length && length <= FBUtilities.MAX_UNSIGNED_SHORT : length;
         out.writeShort(length);
-        write(buffer, out); // writing data bytes to output source
+        out.write(buffer);
+    }
+
+    public static void writeWithShortLength(byte[] buffer, DataOutput out) throws IOException
+    {
+        int length = buffer.length;
+        assert 0 <= length && length <= FBUtilities.MAX_UNSIGNED_SHORT : length;
+        out.writeShort(length);
+        out.write(buffer);
     }
 
     public static ByteBuffer readWithLength(DataInput in) throws IOException
@@ -353,6 +327,36 @@ public class ByteBufferUtil
         }
 
         return ByteBufferUtil.read(in, length);
+    }
+
+    public static ByteBuffer readWithVIntLength(DataInputPlus in) throws IOException
+    {
+        int length = (int)in.readVInt();
+        if (length < 0)
+            throw new IOException("Corrupt (negative) value length encountered");
+
+        return ByteBufferUtil.read(in, length);
+    }
+
+    public static int serializedSizeWithLength(ByteBuffer buffer)
+    {
+        int size = buffer.remaining();
+        return TypeSizes.sizeof(size) + size;
+    }
+
+    public static int serializedSizeWithVIntLength(ByteBuffer buffer)
+    {
+        int size = buffer.remaining();
+        return TypeSizes.sizeofVInt(size) + size;
+    }
+
+    public static void skipWithVIntLength(DataInputPlus in) throws IOException
+    {
+        int length = (int)in.readVInt();
+        if (length < 0)
+            throw new IOException("Corrupt (negative) value length encountered");
+
+        FileUtils.skipBytesFully(in, length);
     }
 
     /* @return An unsigned short in an integer. */
@@ -371,25 +375,27 @@ public class ByteBufferUtil
         return ByteBufferUtil.read(in, readShortLength(in));
     }
 
+    public static int serializedSizeWithShortLength(ByteBuffer buffer)
+    {
+        int size = buffer.remaining();
+        return TypeSizes.sizeof((short)size) + size;
+    }
+
     /**
      * @param in data input
      * @return null
      * @throws IOException if an I/O error occurs.
      */
-    public static ByteBuffer skipShortLength(DataInput in) throws IOException
+    public static void skipShortLength(DataInput in) throws IOException
     {
         int skip = readShortLength(in);
         FileUtils.skipBytesFully(in, skip);
-        return null;
     }
 
     public static ByteBuffer read(DataInput in, int length) throws IOException
     {
         if (length == 0)
             return EMPTY_BYTE_BUFFER;
-
-        if (in instanceof FileDataInput)
-            return ((FileDataInput) in).readBytes(length);
 
         byte[] buff = new byte[length];
         in.readFully(buff);
@@ -416,6 +422,18 @@ public class ByteBufferUtil
         return bytes.getInt(bytes.position());
     }
 
+    /**
+     * Convert a byte buffer to a short.
+     * Does not change the byte buffer position.
+     *
+     * @param bytes byte buffer to convert to short
+     * @return short representation of the byte buffer
+     */
+    public static short toShort(ByteBuffer bytes)
+    {
+        return bytes.getShort(bytes.position());
+    }
+
     public static long toLong(ByteBuffer bytes)
     {
         return bytes.getLong(bytes.position());
@@ -429,6 +447,11 @@ public class ByteBufferUtil
     public static double toDouble(ByteBuffer bytes)
     {
         return bytes.getDouble(bytes.position());
+    }
+
+    public static ByteBuffer bytes(short s)
+    {
+        return ByteBuffer.allocate(2).putShort(0, s);
     }
 
     public static ByteBuffer bytes(int i)
@@ -484,8 +507,16 @@ public class ByteBufferUtil
         };
     }
 
+    /*
+     * Does not modify position or limit of buffer even temporarily
+     * so this is safe even without duplication.
+     */
     public static String bytesToHex(ByteBuffer bytes)
     {
+        if (bytes.hasArray()) {
+            return Hex.bytesToHex(bytes.array(), bytes.arrayOffset() + bytes.position(), bytes.remaining());
+        }
+
         final int offset = bytes.position();
         final int size = bytes.remaining();
         final char[] c = new char[size * 2];
@@ -552,4 +583,48 @@ public class ByteBufferUtil
         int diff = value.remaining() - prefix.remaining();
         return prefix.equals(value.duplicate().limit(value.remaining() - diff));
     }
+
+    /** trims size of bytebuffer to exactly number of bytes in it, to do not hold too much memory */
+    public static ByteBuffer minimalBufferFor(ByteBuffer buf)
+    {
+        return buf.capacity() > buf.remaining() || !buf.hasArray() ? ByteBuffer.wrap(getArray(buf)) : buf;
+    }
+
+    // Doesn't change bb position
+    public static int getShortLength(ByteBuffer bb, int position)
+    {
+        int length = (bb.get(position) & 0xFF) << 8;
+        return length | (bb.get(position + 1) & 0xFF);
+    }
+
+    // changes bb position
+    public static int readShortLength(ByteBuffer bb)
+    {
+        int length = (bb.get() & 0xFF) << 8;
+        return length | (bb.get() & 0xFF);
+    }
+
+    // changes bb position
+    public static void writeShortLength(ByteBuffer bb, int length)
+    {
+        bb.put((byte) ((length >> 8) & 0xFF));
+        bb.put((byte) (length & 0xFF));
+    }
+
+    // changes bb position
+    public static ByteBuffer readBytes(ByteBuffer bb, int length)
+    {
+        ByteBuffer copy = bb.duplicate();
+        copy.limit(copy.position() + length);
+        bb.position(bb.position() + length);
+        return copy;
+    }
+
+    // changes bb position
+    public static ByteBuffer readBytesWithShortLength(ByteBuffer bb)
+    {
+        int length = readShortLength(bb);
+        return readBytes(bb, length);
+    }
+
 }

@@ -19,6 +19,8 @@ package org.apache.pig.backend.hadoop;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.Map;
 
 import org.apache.pig.PigException;
@@ -59,6 +61,72 @@ public class HDataType {
     static NullableBag defDB = new NullableBag();
     static NullableTuple defTup = new NullableTuple();
     static Map<Byte, String> typeToName = null;
+
+    private static final HashMap<String, Byte> classToTypeMap = new HashMap<String, Byte>();
+    static {
+        classToTypeMap.put("org.apache.pig.impl.io.NullableBag", DataType.BAG);
+        classToTypeMap.put("org.apache.pig.impl.io.NullableBigDecimalWritable", DataType.BIGDECIMAL);
+        classToTypeMap.put("org.apache.pig.impl.io.NullableBigIntegerWritable", DataType.BIGINTEGER);
+        classToTypeMap.put("org.apache.pig.impl.io.NullableBooleanWritable", DataType.BOOLEAN);
+        classToTypeMap.put("org.apache.pig.impl.io.NullableBytesWritable", DataType.BYTEARRAY);
+        classToTypeMap.put("org.apache.pig.impl.io.NullableDateTimeWritable", DataType.DATETIME);
+        classToTypeMap.put("org.apache.pig.impl.io.NullableDoubleWritable", DataType.DOUBLE);
+        classToTypeMap.put("org.apache.pig.impl.io.NullableFloatWritable", DataType.FLOAT);
+        classToTypeMap.put("org.apache.pig.impl.io.NullableIntWritable", DataType.INTEGER);
+        classToTypeMap.put("org.apache.pig.impl.io.NullableLongWritable", DataType.LONG);
+        classToTypeMap.put("org.apache.pig.impl.io.NullableText", DataType.CHARARRAY);
+        classToTypeMap.put("org.apache.pig.impl.io.NullableTuple", DataType.TUPLE);
+    }
+
+    public static PigNullableWritable getWritableComparable(String className) throws ExecException {
+        if (classToTypeMap.containsKey(className)) {
+            return getWritableComparableTypes(null, classToTypeMap.get(className));
+        } else {
+            throw new ExecException("Unable to map " + className + " to known types." + Arrays.toString(classToTypeMap.keySet().toArray()));
+        }
+    }
+
+    public static PigNullableWritable getNewWritableComparable(byte keyType) throws ExecException {
+        switch (keyType) {
+            case DataType.BAG:
+                return new NullableBag();
+            case DataType.BOOLEAN:
+                return new NullableBooleanWritable();
+            case DataType.BYTEARRAY:
+                return new NullableBytesWritable();
+            case DataType.CHARARRAY:
+                return new NullableText();
+            case DataType.DOUBLE:
+                return new NullableDoubleWritable();
+            case DataType.FLOAT:
+                return new NullableFloatWritable();
+            case DataType.INTEGER:
+                return new NullableIntWritable();
+            case DataType.BIGINTEGER:
+                return new NullableBigIntegerWritable();
+            case DataType.BIGDECIMAL:
+                return new NullableBigDecimalWritable();
+            case DataType.LONG:
+                return new NullableLongWritable();
+            case DataType.DATETIME:
+                return new NullableDateTimeWritable();
+            case DataType.TUPLE:
+                return new NullableTuple();
+            case DataType.MAP: {
+                int errCode = 1068;
+                String msg = "Using Map as key not supported.";
+                throw new ExecException(msg, errCode, PigException.INPUT);
+            }
+            default: {
+                if (typeToName == null) typeToName = DataType.genTypeToNameMap();
+                int errCode = 2044;
+                String msg = "The type "
+                    + typeToName.get(keyType) == null ? "" + keyType : typeToName.get(keyType)
+                    + " cannot be collected as a Key type";
+                throw new ExecException(msg, errCode, PigException.BUG);
+            }
+        }
+    }
 
     public static PigNullableWritable getWritableComparableTypes(Object o, byte keyType) throws ExecException{
 
@@ -233,6 +301,14 @@ public class HDataType {
             throw new ExecException(msg, errCode, PigException.BUG);
         }
         return wcKey;
+    }
+
+    public static byte findTypeFromClassName(String className) throws ExecException {
+        if (classToTypeMap.containsKey(className)) {
+            return classToTypeMap.get(className);
+        } else {
+            throw new ExecException("Unable to map " + className + " to known types." + Arrays.toString(classToTypeMap.keySet().toArray()));
+        }
     }
 
     public static byte findTypeFromNullableWritable(PigNullableWritable o) throws ExecException {

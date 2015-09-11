@@ -23,8 +23,10 @@ import java.util.Map;
 import java.util.List;
 
 import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.TypeSerializer;
 
 public class ReversedType<T> extends AbstractType<T>
@@ -50,15 +52,21 @@ public class ReversedType<T> extends AbstractType<T>
             type = new ReversedType<T>(baseType);
             instances.put(baseType, type);
         }
-        return (ReversedType<T>) type;
+        return type;
     }
 
     private ReversedType(AbstractType<T> baseType)
     {
+        super(ComparisonType.CUSTOM);
         this.baseType = baseType;
     }
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public boolean isEmptyValueMeaningless()
+    {
+        return baseType.isEmptyValueMeaningless();
+    }
+
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         // An empty byte buffer is always smaller
         if (o1.remaining() == 0)
@@ -73,6 +81,12 @@ public class ReversedType<T> extends AbstractType<T>
         return baseType.compare(o2, o1);
     }
 
+    @Override
+    public int compareForCQL(ByteBuffer v1, ByteBuffer v2)
+    {
+        return baseType.compare(v1, v2);
+    }
+
     public String getString(ByteBuffer bytes)
     {
         return baseType.getString(bytes);
@@ -84,6 +98,33 @@ public class ReversedType<T> extends AbstractType<T>
     }
 
     @Override
+    public Term fromJSONObject(Object parsed) throws MarshalException
+    {
+        return baseType.fromJSONObject(parsed);
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    {
+        return baseType.toJSONString(buffer, protocolVersion);
+    }
+
+    @Override
+    public boolean isCompatibleWith(AbstractType<?> otherType)
+    {
+        if (!(otherType instanceof ReversedType))
+            return false;
+
+        return this.baseType.isCompatibleWith(((ReversedType) otherType).baseType);
+    }
+
+    @Override
+    public boolean isValueCompatibleWith(AbstractType<?> otherType)
+    {
+        return this.baseType.isValueCompatibleWith(otherType);
+    }
+
+    @Override
     public CQL3Type asCQL3Type()
     {
         return baseType.asCQL3Type();
@@ -92,6 +133,12 @@ public class ReversedType<T> extends AbstractType<T>
     public TypeSerializer<T> getSerializer()
     {
         return baseType.getSerializer();
+    }
+
+    @Override
+    protected int valueLengthIfFixed()
+    {
+        return baseType.valueLengthIfFixed();
     }
 
     @Override

@@ -62,9 +62,11 @@ public class FLEPredicateTest extends ZKTestCase {
          */
         for(int i = 0; i < 3; i++) {
             peers.put(Long.valueOf(i),
-                    new QuorumServer(i,
-                            new InetSocketAddress(PortAssignment.unique()),
-                    new InetSocketAddress(PortAssignment.unique())));
+                new QuorumServer(i,
+                    new InetSocketAddress(
+                        "127.0.0.1", PortAssignment.unique()),
+                    new InetSocketAddress(
+                        "127.0.0.1", PortAssignment.unique())));
         }
 
         /*
@@ -76,6 +78,7 @@ public class FLEPredicateTest extends ZKTestCase {
                                         PortAssignment.unique(), 3, 0, 1000, 2, 2);
         
             MockFLE mock = new MockFLE(peer);
+            mock.start();
             
             /*
              * Lower epoch must return false

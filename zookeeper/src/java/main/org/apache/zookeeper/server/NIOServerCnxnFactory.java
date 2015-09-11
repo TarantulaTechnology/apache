@@ -31,10 +31,10 @@ import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Queue;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -118,7 +118,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
      * of code shared by the AcceptThread (which selects on the listen socket)
      * and SelectorThread (which selects on client connections) classes.
      */
-    private abstract class AbstractSelectThread extends Thread {
+    private abstract class AbstractSelectThread extends ZooKeeperThread {
         protected final Selector selector;
 
         public AbstractSelectThread(String name) throws IOException {
@@ -561,7 +561,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
      * This thread is responsible for closing stale connections so that
      * connections on which no session is established are properly expired.
      */
-    private class ConnectionExpirerThread extends Thread {
+    private class ConnectionExpirerThread extends ZooKeeperThread {
         ConnectionExpirerThread() {
             super("ConnnectionExpirer");
         }
@@ -639,7 +639,10 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         new HashSet<SelectorThread>();
 
     @Override
-    public void configure(InetSocketAddress addr, int maxcc) throws IOException {
+    public void configure(InetSocketAddress addr, int maxcc, boolean secure) throws IOException {
+        if (secure) {
+            throw new UnsupportedOperationException("SSL isn't supported in NIOServerCnxn");
+        }
         configureSaslLogin();
 
         maxClientCnxns = maxcc;
@@ -742,12 +745,14 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
     }
 
     @Override
-    public void startup(ZooKeeperServer zks) throws IOException,
-            InterruptedException {
+    public void startup(ZooKeeperServer zks, boolean startServer)
+            throws IOException, InterruptedException {
         start();
-        zks.startdata();
-        zks.startup();
         setZooKeeperServer(zks);
+        if (startServer) {
+            zks.startdata();
+            zks.startup();
+        }
     }
 
     @Override
@@ -908,11 +913,13 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
     }
 
     @Override
-    public void closeSession(long sessionId) {
+    public boolean closeSession(long sessionId) {
         NIOServerCnxn cnxn = sessionMap.remove(sessionId);
         if (cnxn != null) {
             cnxn.close();
+            return true;
         }
+        return false;
     }
 
     @Override
@@ -938,4 +945,21 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         cnxnExpiryQueue.dump(pwriter);
     }
 
+    @Override
+    public void resetAllConnectionStats() {
+        // No need to synchronize since cnxns is backed by a ConcurrentHashMap
+        for(ServerCnxn c : cnxns){
+            c.resetStats();
+        }
+    }
+
+    @Override
+    public Iterable<Map<String, Object>> getAllConnectionInfo(boolean brief) {
+        HashSet<Map<String,Object>> info = new HashSet<Map<String,Object>>();
+        // No need to synchronize since cnxns is backed by a ConcurrentHashMap
+        for (ServerCnxn c : cnxns) {
+            info.add(c.getConnectionInfo(brief));
+        }
+        return info;
+    }
 }

@@ -21,6 +21,8 @@ import java.io.*;
 
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
 
 /**
  * HeartBeat State associated with any given endpoint.
@@ -63,6 +65,11 @@ class HeartBeatState
         generation += 1;
     }
 
+    void forceHighestPossibleVersionUnsafe()
+    {
+        version = Integer.MAX_VALUE;
+    }
+
     public String toString()
     {
         return String.format("HeartBeat: generation = %d, version = %d", generation, version);
@@ -71,19 +78,19 @@ class HeartBeatState
 
 class HeartBeatStateSerializer implements IVersionedSerializer<HeartBeatState>
 {
-    public void serialize(HeartBeatState hbState, DataOutput out, int version) throws IOException
+    public void serialize(HeartBeatState hbState, DataOutputPlus out, int version) throws IOException
     {
         out.writeInt(hbState.getGeneration());
         out.writeInt(hbState.getHeartBeatVersion());
     }
 
-    public HeartBeatState deserialize(DataInput in, int version) throws IOException
+    public HeartBeatState deserialize(DataInputPlus in, int version) throws IOException
     {
         return new HeartBeatState(in.readInt(), in.readInt());
     }
 
     public long serializedSize(HeartBeatState state, int version)
     {
-        return TypeSizes.NATIVE.sizeof(state.getGeneration()) + TypeSizes.NATIVE.sizeof(state.getHeartBeatVersion());
+        return TypeSizes.sizeof(state.getGeneration()) + TypeSizes.sizeof(state.getHeartBeatVersion());
     }
 }

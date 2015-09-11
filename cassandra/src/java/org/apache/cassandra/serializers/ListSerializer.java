@@ -18,6 +18,8 @@
 
 package org.apache.cassandra.serializers;
 
+import org.apache.cassandra.transport.Server;
+
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.*;
@@ -45,22 +47,62 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
         this.elements = elements;
     }
 
-    public List<T> deserialize(ByteBuffer bytes)
+    public List<ByteBuffer> serializeValues(List<T> values)
+    {
+        List<ByteBuffer> buffers = new ArrayList<>(values.size());
+        for (T value : values)
+            buffers.add(elements.serialize(value));
+        return buffers;
+    }
+
+    public int getElementCount(List<T> value)
+    {
+        return value.size();
+    }
+
+    public void validateForNativeProtocol(ByteBuffer bytes, int version)
     {
         try
         {
             ByteBuffer input = bytes.duplicate();
-            int n = getUnsignedShort(input);
+            int n = readCollectionSize(input, version);
+            for (int i = 0; i < n; i++)
+                elements.validate(readValue(input, version));
+
+            if (input.hasRemaining())
+                throw new MarshalException("Unexpected extraneous bytes after list value");
+        }
+        catch (BufferUnderflowException e)
+        {
+            throw new MarshalException("Not enough bytes to read a list");
+        }
+    }
+
+    public List<T> deserializeForNativeProtocol(ByteBuffer bytes, int version)
+    {
+        try
+        {
+            ByteBuffer input = bytes.duplicate();
+            int n = readCollectionSize(input, version);
             List<T> l = new ArrayList<T>(n);
             for (int i = 0; i < n; i++)
             {
-                int s = getUnsignedShort(input);
-                byte[] data = new byte[s];
-                input.get(data);
-                ByteBuffer databb = ByteBuffer.wrap(data);
-                elements.validate(databb);
-                l.add(elements.deserialize(databb));
+                // We can have nulls in lists that are used for IN values
+                ByteBuffer databb = readValue(input, version);
+                if (databb != null)
+                {
+                    elements.validate(databb);
+                    l.add(elements.deserialize(databb));
+                }
+                else
+                {
+                    l.add(null);
+                }
             }
+
+            if (input.hasRemaining())
+                throw new MarshalException("Unexpected extraneous bytes after list value");
+
             return l;
         }
         catch (BufferUnderflowException e)
@@ -70,41 +112,47 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
     }
 
     /**
-     * Layout is: {@code <n><s_1><b_1>...<s_n><b_n> }
-     * where:
-     *   n is the number of elements
-     *   s_i is the number of bytes composing the ith element
-     *   b_i is the s_i bytes composing the ith element
+     * Returns the element at the given index in a list.
+     * @param serializedList a serialized list
+     * @param index the index to get
+     * @return the serialized element at the given index, or null if the index exceeds the list size
      */
-    public ByteBuffer serialize(List<T> value)
+    public ByteBuffer getElement(ByteBuffer serializedList, int index)
     {
-        List<ByteBuffer> bbs = new ArrayList<ByteBuffer>(value.size());
-        int size = 0;
-        for (T elt : value)
+        try
         {
-            ByteBuffer bb = elements.serialize(elt);
-            bbs.add(bb);
-            size += 2 + bb.remaining();
+            ByteBuffer input = serializedList.duplicate();
+            int n = readCollectionSize(input, Server.VERSION_3);
+            if (n <= index)
+                return null;
+
+            for (int i = 0; i < index; i++)
+            {
+                int length = input.getInt();
+                input.position(input.position() + length);
+            }
+            return readValue(input, Server.VERSION_3);
         }
-        return pack(bbs, value.size(), size);
+        catch (BufferUnderflowException e)
+        {
+            throw new MarshalException("Not enough bytes to read a list");
+        }
     }
 
     public String toString(List<T> value)
     {
         StringBuilder sb = new StringBuilder();
         boolean isFirst = true;
+        sb.append('[');
         for (T element : value)
         {
             if (isFirst)
-            {
                 isFirst = false;
-            }
             else
-            {
-                sb.append("; ");
-            }
+                sb.append(", ");
             sb.append(elements.toString(element));
         }
+        sb.append(']');
         return sb.toString();
     }
 

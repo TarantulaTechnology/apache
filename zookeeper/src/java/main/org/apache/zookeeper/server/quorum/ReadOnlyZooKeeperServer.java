@@ -18,6 +18,8 @@
 
 package org.apache.zookeeper.server.quorum;
 
+import java.io.PrintWriter;
+
 import org.apache.zookeeper.jmx.MBeanRegistry;
 import org.apache.zookeeper.server.DataTreeBean;
 import org.apache.zookeeper.server.FinalRequestProcessor;
@@ -36,11 +38,16 @@ import org.apache.zookeeper.server.persistence.FileTxnSnapLog;
  * The very first processor in the chain of request processors is a
  * ReadOnlyRequestProcessor which drops state-changing requests.
  */
-public class ReadOnlyZooKeeperServer extends QuorumZooKeeperServer {
+public class ReadOnlyZooKeeperServer extends ZooKeeperServer {
 
+    protected final QuorumPeer self;
     private volatile boolean shutdown = false;
-    ReadOnlyZooKeeperServer(FileTxnSnapLog logFactory, QuorumPeer self, ZKDatabase zkDb) {
-        super(logFactory, self.tickTime, self.minSessionTimeout, self.maxSessionTimeout, zkDb, self);
+
+    ReadOnlyZooKeeperServer(FileTxnSnapLog logFactory, QuorumPeer self,
+                            ZKDatabase zkDb) {
+        super(logFactory, self.tickTime, self.minSessionTimeout,
+              self.maxSessionTimeout, zkDb);
+        this.self = self;
     }
 
     @Override
@@ -61,7 +68,8 @@ public class ReadOnlyZooKeeperServer extends QuorumZooKeeperServer {
         }
         registerJMX(new ReadOnlyBean(this), self.jmxLocalPeerBean);
         super.startup();
-        self.cnxnFactory.setZooKeeperServer(this);
+        self.setZooKeeperServer(this);
+        self.adminServer.setZooKeeperServer(this);
         LOG.info("Read-only server started");
     }
 
@@ -129,16 +137,39 @@ public class ReadOnlyZooKeeperServer extends QuorumZooKeeperServer {
 
     @Override
     public synchronized void shutdown() {
+        if (!isRunning()) {
+            LOG.debug("ZooKeeper server is not running, so not proceeding to shutdown!");
+            return;
+        }
         shutdown = true;
         unregisterJMX(this);
 
         // set peer's server to null
-        self.cnxnFactory.setZooKeeperServer(null);
+        self.setZooKeeperServer(null);
         // clear all the connections
-        self.cnxnFactory.closeAll();
+        self.closeAllConnections();
+
+        self.adminServer.setZooKeeperServer(null);
 
         // shutdown the server itself
         super.shutdown();
     }
 
+    @Override
+    public void dumpConf(PrintWriter pwriter) {
+        super.dumpConf(pwriter);
+
+        pwriter.print("initLimit=");
+        pwriter.println(self.getInitLimit());
+        pwriter.print("syncLimit=");
+        pwriter.println(self.getSyncLimit());
+        pwriter.print("electionAlg=");
+        pwriter.println(self.getElectionType());
+        pwriter.print("electionPort=");
+        pwriter.println(self.getElectionAddress().getPort());
+        pwriter.print("quorumPort=");
+        pwriter.println(self.getQuorumAddress().getPort());
+        pwriter.print("peerType=");
+        pwriter.println(self.getLearnerType().ordinal());
+    }
 }

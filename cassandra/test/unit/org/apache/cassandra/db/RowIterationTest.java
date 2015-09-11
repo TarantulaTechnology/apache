@@ -18,92 +18,65 @@
 */
 package org.apache.cassandra.db;
 
-import java.io.IOException;
-import java.net.InetAddress;
-import java.nio.ByteBuffer;
-import java.util.concurrent.ExecutionException;
-import java.util.Set;
-import java.util.HashSet;
-
-import org.apache.cassandra.Util;
-
 import org.junit.Test;
 
-import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.db.marshal.CompositeType;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.Util;
+
 import static org.junit.Assert.assertEquals;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertFalse;
 
 
-public class RowIterationTest extends SchemaLoader
+public class RowIterationTest extends CQLTester
 {
-    public static final String KEYSPACE1 = "Keyspace2";
-    public static final InetAddress LOCAL = FBUtilities.getBroadcastAddress();
-
     @Test
-    public void testRowIteration() throws IOException, ExecutionException, InterruptedException
+    public void testRowIteration() throws Throwable
     {
-        Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore("Super3");
-
-        final int ROWS_PER_SSTABLE = 10;
-        Set<DecoratedKey> inserted = new HashSet<DecoratedKey>();
-        for (int i = 0; i < ROWS_PER_SSTABLE; i++) {
-            DecoratedKey key = Util.dk(String.valueOf(i));
-            RowMutation rm = new RowMutation(KEYSPACE1, key.key);
-            rm.add("Super3", CompositeType.build(ByteBufferUtil.bytes("sc"), ByteBufferUtil.bytes(String.valueOf(i))), ByteBuffer.wrap(new byte[ROWS_PER_SSTABLE * 10 - i * 2]), i);
-            rm.apply();
-            inserted.add(key);
-        }
-        store.forceBlockingFlush();
-        assertEquals(inserted.toString(), inserted.size(), Util.getRangeSlice(store).size());
+        String tableName = createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY (a, b, c))");
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        for (int i = 0; i < 10; i++)
+            execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?) USING TIMESTAMP ?", i, 0, i, i, (long)i);
+        cfs.forceBlockingFlush();
+        assertEquals(10, execute("SELECT * FROM %s").size());
     }
 
     @Test
-    public void testRowIterationDeletionTime() throws IOException, ExecutionException, InterruptedException
+    public void testRowIterationDeletionTime() throws Throwable
     {
-        Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        String CF_NAME = "Standard3";
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_NAME);
-        DecoratedKey key = Util.dk("key");
+        String tableName = createTable("CREATE TABLE %s (a int PRIMARY KEY, b int)");
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
 
-        // Delete row in first sstable
-        RowMutation rm = new RowMutation(KEYSPACE1, key.key);
-        rm.delete(CF_NAME, 0);
-        rm.add(CF_NAME, ByteBufferUtil.bytes("c"), ByteBufferUtil.bytes("values"), 0L);
-        DeletionInfo delInfo1 = rm.getColumnFamilies().iterator().next().deletionInfo();
-        rm.apply();
-        store.forceBlockingFlush();
+        execute("INSERT INTO %s (a, b) VALUES (?, ?) USING TIMESTAMP ?", 0, 0, 0L);
+        execute("DELETE FROM %s USING TIMESTAMP ? WHERE a = ?", 0L, 0);
+
+        cfs.forceBlockingFlush();
 
         // Delete row in second sstable with higher timestamp
-        rm = new RowMutation(KEYSPACE1, key.key);
-        rm.delete(CF_NAME, 1);
-        rm.add(CF_NAME, ByteBufferUtil.bytes("c"), ByteBufferUtil.bytes("values"), 1L);
-        DeletionInfo delInfo2 = rm.getColumnFamilies().iterator().next().deletionInfo();
-        assert delInfo2.getTopLevelDeletion().markedForDeleteAt == 1L;
-        rm.apply();
-        store.forceBlockingFlush();
+        execute("INSERT INTO %s (a, b) VALUES (?, ?) USING TIMESTAMP ?", 0, 0, 1L);
+        execute("DELETE FROM %s USING TIMESTAMP ? WHERE a = ?", 1L, 0);
 
-        ColumnFamily cf = Util.getRangeSlice(store).iterator().next().cf;
-        assert cf.deletionInfo().equals(delInfo2);
+        int localDeletionTime = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs).build()).partitionLevelDeletion().localDeletionTime();
+
+        cfs.forceBlockingFlush();
+
+        DeletionTime dt = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs).build()).partitionLevelDeletion();
+        assertEquals(1L, dt.markedForDeleteAt());
+        assertEquals(localDeletionTime, dt.localDeletionTime());
     }
 
     @Test
-    public void testRowIterationDeletion() throws IOException, ExecutionException, InterruptedException
+    public void testRowIterationDeletion() throws Throwable
     {
-        Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        String CF_NAME = "Standard3";
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_NAME);
-        DecoratedKey key = Util.dk("key");
+        String tableName = createTable("CREATE TABLE %s (a int PRIMARY KEY, b int)");
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
 
         // Delete a row in first sstable
-        RowMutation rm = new RowMutation(KEYSPACE1, key.key);
-        rm.delete(CF_NAME, 0);
-        rm.apply();
-        store.forceBlockingFlush();
+        execute("DELETE FROM %s USING TIMESTAMP ? WHERE a = ?", 0L, 0);
+        cfs.forceBlockingFlush();
 
-        ColumnFamily cf = Util.getRangeSlice(store).iterator().next().cf;
-        assert cf != null;
+        assertFalse(Util.getOnlyPartitionUnfiltered(Util.cmd(cfs).build()).isEmpty());
     }
 }

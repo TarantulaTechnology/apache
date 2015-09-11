@@ -18,6 +18,22 @@
 
 package org.apache.pig.impl.util.avro;
 
+import com.google.common.base.Function;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.Lists;
+import org.apache.avro.Schema;
+import org.apache.avro.Schema.Field;
+import org.apache.avro.Schema.Type;
+import org.apache.avro.generic.GenericArray;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericEnumSymbol;
+import org.apache.avro.generic.IndexedRecord;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.pig.backend.executionengine.ExecException;
+import org.apache.pig.data.DataByteArray;
+import org.apache.pig.data.Tuple;
+
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
@@ -26,27 +42,13 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
-import org.apache.avro.Schema;
-import org.apache.avro.Schema.Field;
-import org.apache.avro.Schema.Type;
-import org.apache.avro.generic.GenericArray;
-import org.apache.avro.generic.GenericData;
-import org.apache.avro.generic.IndexedRecord;
-import org.apache.commons.logging.LogFactory;
-import org.apache.pig.backend.executionengine.ExecException;
-import org.apache.pig.data.DataByteArray;
-import org.apache.pig.data.Tuple;
-
-import com.google.common.base.Function;
-import com.google.common.collect.Iterators;
-import com.google.common.collect.Lists;
-
 /**
  * Object that wraps an Avro object in a tuple.
  * @param <T> The type of the Avro object
  */
 public final class AvroTupleWrapper <T extends IndexedRecord>
     implements Tuple {
+    private static final Log LOG = LogFactory.getLog(AvroTupleWrapper.class);
 
   /**
    * The Avro object wrapped in the pig Tuple.
@@ -130,24 +132,35 @@ public final class AvroTupleWrapper <T extends IndexedRecord>
       case BYTES:
         return new DataByteArray(((ByteBuffer) o).array());
       case UNION:
-        if (o instanceof org.apache.avro.util.Utf8) {
-          return o.toString();
-        } else if (o instanceof IndexedRecord) {
-          return new AvroTupleWrapper<T>((T) o);
-        } else if (o instanceof GenericArray) {
-          return new AvroBagWrapper<GenericData.Record>(
-              (GenericArray<GenericData.Record>) o);
-        } else if (o instanceof Map) {
-          return new AvroMapWrapper((Map<CharSequence, Object>) o);
-        } else if (o instanceof GenericData.Fixed) {
-          return new DataByteArray(((GenericData.Fixed) o).bytes());
-        } else if (o instanceof ByteBuffer) {
-          return new DataByteArray(((ByteBuffer) o).array());
-        }
+        return getPigObject(o);
       default:
         return o;
     }
+  }
 
+  /**
+   * @param o An Avro object to convert to an equivalent type in Pig
+   * @return Equivalent Pig object
+   */
+  public static Object getPigObject(Object o) {
+    if (o instanceof org.apache.avro.util.Utf8) {
+      return o.toString();
+    } else if (o instanceof IndexedRecord) {
+      return new AvroTupleWrapper<IndexedRecord>((IndexedRecord) o);
+    } else if (o instanceof GenericArray) {
+      return new AvroBagWrapper<GenericData.Record>(
+          (GenericArray<GenericData.Record>) o);
+    } else if (o instanceof Map) {
+      return new AvroMapWrapper((Map<CharSequence, Object>) o);
+    } else if (o instanceof GenericData.Fixed) {
+      return new DataByteArray(((GenericData.Fixed) o).bytes());
+    } else if (o instanceof ByteBuffer) {
+      return new DataByteArray(((ByteBuffer) o).array());
+    } else if (o instanceof GenericEnumSymbol) {
+      return o.toString();
+    } else {
+      return o;
+    }
   }
 
   @Override
@@ -158,8 +171,7 @@ public final class AvroTupleWrapper <T extends IndexedRecord>
       try {
         all.add(get(f.pos()));
       } catch (ExecException e) {
-        LogFactory.getLog(getClass()).error(
-            "could not process tuple with contents " + avroObject, e);
+        LOG.error("could not process tuple with contents " + avroObject, e);
         return null;
       }
     }

@@ -18,36 +18,49 @@
 package org.apache.cassandra.db.compaction;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.*;
 
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.RowMutation;
-import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.io.sstable.SSTable;
-import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.UpdateBuilder;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.schema.CompactionParams;
+import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.utils.FBUtilities;
 
-public class LongLeveledCompactionStrategyTest extends SchemaLoader
+public class LongLeveledCompactionStrategyTest
 {
+    public static final String KEYSPACE1 = "LongLeveledCompactionStrategyTest";
+    public static final String CF_STANDARDLVL = "StandardLeveled";
+
+    @BeforeClass
+    public static void defineSchema() throws ConfigurationException
+    {
+        Map<String, String> leveledOptions = new HashMap<>();
+        leveledOptions.put("sstable_size_in_mb", "1");
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE1,
+                                    KeyspaceParams.simple(1),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARDLVL)
+                                                .compaction(CompactionParams.lcs(leveledOptions)));
+    }
+
     @Test
     public void testParallelLeveledCompaction() throws Exception
     {
-        String ksname = "Keyspace1";
+        String ksname = KEYSPACE1;
         String cfname = "StandardLeveled";
         Keyspace keyspace = Keyspace.open(ksname);
         ColumnFamilyStore store = keyspace.getColumnFamilyStore(cfname);
         store.disableAutoCompaction();
 
-        LeveledCompactionStrategy lcs = (LeveledCompactionStrategy)store.getCompactionStrategy();
+        LeveledCompactionStrategy lcs = (LeveledCompactionStrategy)store.getCompactionStrategyManager().getStrategies().get(1);
 
         ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]); // 100 KB value, make it easy to have multiple files
 
@@ -59,11 +72,11 @@ public class LongLeveledCompactionStrategyTest extends SchemaLoader
         for (int r = 0; r < rows; r++)
         {
             DecoratedKey key = Util.dk(String.valueOf(r));
-            RowMutation rm = new RowMutation(ksname, key.key);
+            UpdateBuilder builder = UpdateBuilder.create(store.metadata, key);
             for (int c = 0; c < columns; c++)
-            {
-                rm.add(cfname, ByteBufferUtil.bytes("column" + c), value, 0);
-            }
+                builder.newRow("column" + c).add("val", value);
+
+            Mutation rm = new Mutation(builder.build());
             rm.apply();
             store.forceBlockingFlush();
         }
@@ -77,14 +90,14 @@ public class LongLeveledCompactionStrategyTest extends SchemaLoader
         {
             while (true)
             {
-                final AbstractCompactionTask t = lcs.getMaximalTask(Integer.MIN_VALUE);
-                if (t == null)
+                final AbstractCompactionTask nextTask = lcs.getNextBackgroundTask(Integer.MIN_VALUE);
+                if (nextTask == null)
                     break;
                 tasks.add(new Runnable()
                 {
                     public void run()
                     {
-                        t.execute(null);
+                        nextTask.execute(null);
                     }
                 });
             }
@@ -106,20 +119,19 @@ public class LongLeveledCompactionStrategyTest extends SchemaLoader
         {
             List<SSTableReader> sstables = manifest.getLevel(level);
             // score check
-            assert (double) SSTable.getTotalBytes(sstables) / manifest.maxBytesForLevel(level) < 1.00;
+            assert (double) SSTableReader.getTotalBytes(sstables) / LeveledManifest.maxBytesForLevel(level, 1 * 1024 * 1024) < 1.00;
             // overlap check for levels greater than 0
-            if (level > 0)
+            for (SSTableReader sstable : sstables)
             {
-               for (SSTableReader sstable : sstables)
-               {
-                   Set<SSTableReader> overlaps = LeveledManifest.overlapping(sstable, sstables);
-                   assert overlaps.size() == 1 && overlaps.contains(sstable);
-               }
+                // level check
+                assert level == sstable.getSSTableLevel();
+
+                if (level > 0)
+                {// overlap check for levels greater than 0
+                    Set<SSTableReader> overlaps = LeveledManifest.overlapping(sstable, sstables);
+                    assert overlaps.size() == 1 && overlaps.contains(sstable);
+                }
             }
-        }
-        for (SSTableReader sstable : store.getSSTables())
-        {
-            assert sstable.getSSTableLevel() == sstable.getSSTableLevel();
         }
     }
 }

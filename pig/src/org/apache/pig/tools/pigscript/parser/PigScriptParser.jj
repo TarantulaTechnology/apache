@@ -84,6 +84,8 @@ public abstract class PigScriptParser
 
 	abstract protected void processSet(String key, String value) throws IOException, ParseException;
 
+    abstract protected void processSet() throws IOException, ParseException;
+    
     abstract protected void processHistory(boolean withNumbers);
 
 	abstract protected void processCat(String path) throws IOException;
@@ -117,6 +119,10 @@ public abstract class PigScriptParser
 	abstract protected void processIllustrate(String alias, String script, String target, List<String> params, List<String> files) throws IOException, ParseException;
 
 	abstract protected void processScript(String script, boolean batch, List<String> params, List<String> files) throws IOException, ParseException;
+
+    abstract protected void processDefault(String key, String value) throws IOException;
+
+    abstract protected void processDeclare(String key, String value) throws IOException;
 
 	static String unquote(String s)
 	{
@@ -184,6 +190,8 @@ TOKEN: {<XML: "-xml">}
 TOKEN: {<OUT: "-out">}
 TOKEN: {<BRIEF: "-brief">}
 TOKEN: {<N: "-n">}
+TOKEN: {<PIGDEFAULT: "%default" >}
+TOKEN: {<DECLARE: "%declare" >} 
 
 // internal use commands
 TOKEN: {<SCRIPT_DONE: "scriptDone">}
@@ -245,11 +253,12 @@ TOKEN_MGR_DECLS : {
 {
     <"split"> : PIG_START
 |   <"define"> : PIG_START
-|	<"store"> : PIG_START
-|	<"import"> : PIG_START
-| 	<(["a"-"z", "A"-"Z"])+(["a"-"z", "A"-"Z"] | ["0"-"9"] | "_")*(" " | "\t")*"="> : PIG_START
+|   <"store"> : PIG_START
+|   <"assert"> : PIG_START
+|   <"import"> : PIG_START
+|   <(["a"-"z", "A"-"Z"])+(["a"-"z", "A"-"Z"] | ["0"-"9"] | "_")*(" " | "\t")*"="> : PIG_START
 |   <"=>" (" " | "\t")*> : PIG_START
-| 	< <IDENTIFIER> (" " | "\t")* ("," (" " | "\t")* <IDENTIFIER> )* (" " | "\t")* "="> : PIG_START
+|   < <IDENTIFIER> (" " | "\t")* ("," (" " | "\t")* <IDENTIFIER> )* (" " | "\t")* "="> : PIG_START
 |   < <IDENTIFIER> (" " | "\t")* "(" > : PIG_START
 }
 
@@ -417,6 +426,7 @@ TOKEN : { <QUOTEDSTRING :  "'"
           )
       )*
       "'"> }
+TOKEN: {<SHELLCMD: "`" (~["`"])* "`" >}
 void parse() throws IOException:
 {
 	Token t1, t2, t3;
@@ -591,7 +601,19 @@ void parse() throws IOException:
 		t1 = GetKey()
 		t2 = GetValue()
 		{processSet(t1.image, unquote(t2.image));}
+    	|
+		{processSet();}
 	)
+	|
+    <PIGDEFAULT>
+	t1 = GetKey()
+	t2 = GetDefaultValue()
+	{processDefault(t1.image, t2.image);}
+	|
+	<DECLARE>
+	t1 = GetKey()
+	t2 = GetDefaultValue()
+	{processDeclare(t1.image, t2.image);}
 	|
 	<EOF>
 	{quit();}
@@ -788,6 +810,22 @@ Token GetValue() :
 	t = GetPath()
 	|
 	t = <QUOTEDSTRING>
+	)
+
+	{return t;}
+}
+
+Token GetDefaultValue() :
+{
+	Token t;
+}
+{
+	(
+	t = GetPath()
+	|
+	t = <QUOTEDSTRING>
+	|
+	t = <SHELLCMD>
 	)
 
 	{return t;}

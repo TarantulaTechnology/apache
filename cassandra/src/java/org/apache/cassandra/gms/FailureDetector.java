@@ -23,17 +23,16 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
-import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.utils.BoundedStatsDeque;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
@@ -43,11 +42,34 @@ import org.apache.cassandra.utils.FBUtilities;
  */
 public class FailureDetector implements IFailureDetector, FailureDetectorMBean
 {
+    private static final Logger logger = LoggerFactory.getLogger(FailureDetector.class);
     public static final String MBEAN_NAME = "org.apache.cassandra.net:type=FailureDetector";
     private static final int SAMPLE_SIZE = 1000;
+    protected static final long INITIAL_VALUE_NANOS = TimeUnit.NANOSECONDS.convert(getInitialValue(), TimeUnit.MILLISECONDS);
+    private static final long DEFAULT_MAX_PAUSE = 5000L * 1000000L; // 5 seconds
+    private static final long MAX_LOCAL_PAUSE_IN_NANOS = getMaxLocalPause();
+    private long lastInterpret = System.nanoTime();
+    private boolean wasPaused = false;
+
+    private static long getMaxLocalPause()
+    {
+        if (System.getProperty("cassandra.max_local_pause_in_ms") != null)
+        {
+            long pause = Long.parseLong(System.getProperty("cassandra.max_local_pause_in_ms"));
+            logger.warn("Overriding max local pause time to {}ms", pause);
+            return pause * 1000000L;
+        }
+        else
+            return DEFAULT_MAX_PAUSE;
+    }
 
     public static final IFailureDetector instance = new FailureDetector();
-    private static final Logger logger = LoggerFactory.getLogger(FailureDetector.class);
+
+    // this is useless except to provide backwards compatibility in phi_convict_threshold,
+    // because everyone seems pretty accustomed to the default of 8, and users who have
+    // already tuned their phi_convict_threshold for their own environments won't need to
+    // change.
+    private final double PHI_FACTOR = 1.0 / Math.log(10.0); // 0.434...
 
     private final Map<InetAddress, ArrivalWindow> arrivalSamples = new Hashtable<InetAddress, ArrivalWindow>();
     private final List<IFailureDetectionEventListener> fdEvntListeners = new CopyOnWriteArrayList<IFailureDetectionEventListener>();
@@ -63,6 +85,20 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         catch (Exception e)
         {
             throw new RuntimeException(e);
+        }
+    }
+
+    private static long getInitialValue()
+    {
+        String newvalue = System.getProperty("cassandra.fd_initial_value_ms");
+        if (newvalue == null)
+        {
+            return Gossiper.intervalInMillis * 2;
+        }
+        else
+        {
+            logger.info("Overriding FD INITIAL_VALUE to {}ms", newvalue);
+            return Integer.parseInt(newvalue);
         }
     }
 
@@ -90,6 +126,28 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         return nodesStatus;
     }
 
+    public int getDownEndpointCount()
+    {
+        int count = 0;
+        for (Map.Entry<InetAddress, EndpointState> entry : Gossiper.instance.endpointStateMap.entrySet())
+        {
+            if (!entry.getValue().isAlive())
+                count++;
+        }
+        return count;
+    }
+
+    public int getUpEndpointCount()
+    {
+        int count = 0;
+        for (Map.Entry<InetAddress, EndpointState> entry : Gossiper.instance.endpointStateMap.entrySet())
+        {
+            if (entry.getValue().isAlive())
+                count++;
+        }
+        return count;
+    }
+
     public String getEndpointState(String address) throws UnknownHostException
     {
         StringBuilder sb = new StringBuilder();
@@ -100,6 +158,8 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
 
     private void appendEndpointState(StringBuilder sb, EndpointState endpointState)
     {
+        sb.append("  generation:").append(endpointState.getHeartBeatState().getGeneration()).append("\n");
+        sb.append("  heartbeat:").append(endpointState.getHeartBeatState().getHeartBeatVersion()).append("\n");
         for (Map.Entry<ApplicationState, VersionedValue> state : endpointState.applicationState.entrySet())
         {
             if (state.getKey() == ApplicationState.TOKENS)
@@ -115,19 +175,13 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
     {
         File file = FileUtils.createTempFile("failuredetector-", ".dat");
 
-        OutputStream os = null;
-        try
+        try (OutputStream os = new BufferedOutputStream(new FileOutputStream(file, true)))
         {
-            os = new BufferedOutputStream(new FileOutputStream(file, true));
             os.write(toString().getBytes());
         }
         catch (IOException e)
         {
             throw new FSWriteError(e, file);
-        }
-        finally
-        {
-            FileUtils.closeQuietly(os);
         }
     }
 
@@ -155,25 +209,23 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         return epState != null && epState.isAlive();
     }
 
-    public void clear(InetAddress ep)
-    {
-        ArrivalWindow heartbeatWindow = arrivalSamples.get(ep);
-        if (heartbeatWindow != null)
-            heartbeatWindow.clear();
-    }
-
     public void report(InetAddress ep)
     {
         if (logger.isTraceEnabled())
             logger.trace("reporting {}", ep);
-        long now = System.currentTimeMillis();
+        long now = System.nanoTime();
         ArrivalWindow heartbeatWindow = arrivalSamples.get(ep);
         if (heartbeatWindow == null)
         {
+            // avoid adding an empty ArrivalWindow to the Map
             heartbeatWindow = new ArrivalWindow(SAMPLE_SIZE);
+            heartbeatWindow.add(now, ep);
             arrivalSamples.put(ep, heartbeatWindow);
         }
-        heartbeatWindow.add(now);
+        else
+        {
+            heartbeatWindow.add(now, ep);
+        }
     }
 
     public void interpret(InetAddress ep)
@@ -183,12 +235,25 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         {
             return;
         }
-        long now = System.currentTimeMillis();
+        long now = System.nanoTime();
+        long diff = now - lastInterpret;
+        lastInterpret = now;
+        if (diff > MAX_LOCAL_PAUSE_IN_NANOS)
+        {
+            logger.warn("Not marking nodes down due to local pause of {} > {}", diff, MAX_LOCAL_PAUSE_IN_NANOS);
+            wasPaused = true;
+            return;
+        }
+        if (wasPaused)
+        {
+            wasPaused = false;
+            return;
+        }
         double phi = hbWnd.phi(now);
         if (logger.isTraceEnabled())
-            logger.trace("PHI for " + ep + " : " + phi);
+            logger.trace("PHI for {} : {}", ep, phi);
 
-        if (phi > getPhiConvictThreshold())
+        if (PHI_FACTOR * phi > getPhiConvictThreshold())
         {
             logger.trace("notifying listeners that {} is down", ep);
             logger.trace("intervals: {} mean: {}", hbWnd, hbWnd.mean());
@@ -233,7 +298,7 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         {
             ArrivalWindow hWnd = arrivalSamples.get(ep);
             sb.append(ep + " : ");
-            sb.append(hWnd.toString());
+            sb.append(hWnd);
             sb.append(System.getProperty("line.separator"));
         }
         sb.append("-----------------------------------------------------------------------");
@@ -245,11 +310,60 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
     }
 }
 
+/*
+ This class is not thread safe.
+ */
+class ArrayBackedBoundedStats
+{
+    private final long[] arrivalIntervals;
+    private long sum = 0;
+    private int index = 0;
+    private boolean isFilled = false;
+    private volatile double mean = 0;
+
+    public ArrayBackedBoundedStats(final int size)
+    {
+        arrivalIntervals = new long[size];
+    }
+
+    public void add(long interval)
+    {
+        if(index == arrivalIntervals.length)
+        {
+            isFilled = true;
+            index = 0;
+        }
+
+        if(isFilled)
+            sum = sum - arrivalIntervals[index];
+
+        arrivalIntervals[index++] = interval;
+        sum += interval;
+        mean = (double)sum / size();
+    }
+
+    private int size()
+    {
+        return isFilled ? arrivalIntervals.length : index;
+    }
+
+    public double mean()
+    {
+        return mean;
+    }
+
+    public long[] getArrivalIntervals()
+    {
+        return arrivalIntervals;
+    }
+
+}
+
 class ArrivalWindow
 {
     private static final Logger logger = LoggerFactory.getLogger(ArrivalWindow.class);
-    private double tLast = 0L;
-    private final BoundedStatsDeque arrivalIntervals;
+    private long tLast = 0L;
+    private final ArrayBackedBoundedStats arrivalIntervals;
 
     // this is useless except to provide backwards compatibility in phi_convict_threshold,
     // because everyone seems pretty accustomed to the default of 8, and users who have
@@ -260,28 +374,46 @@ class ArrivalWindow
     // in the event of a long partition, never record an interval longer than the rpc timeout,
     // since if a host is regularly experiencing connectivity problems lasting this long we'd
     // rather mark it down quickly instead of adapting
-    private final double MAX_INTERVAL_IN_MS = DatabaseDescriptor.getRpcTimeout();
+    // this value defaults to the same initial value the FD is seeded with
+    private final long MAX_INTERVAL_IN_NANO = getMaxInterval();
 
     ArrivalWindow(int size)
     {
-        arrivalIntervals = new BoundedStatsDeque(size);
+        arrivalIntervals = new ArrayBackedBoundedStats(size);
     }
 
-    synchronized void add(double value)
+    private static long getMaxInterval()
     {
-        double interArrivalTime;
+        String newvalue = System.getProperty("cassandra.fd_max_interval_ms");
+        if (newvalue == null)
+        {
+            return FailureDetector.INITIAL_VALUE_NANOS;
+        }
+        else
+        {
+            logger.info("Overriding FD MAX_INTERVAL to {}ms", newvalue);
+            return TimeUnit.NANOSECONDS.convert(Integer.parseInt(newvalue), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    synchronized void add(long value, InetAddress ep)
+    {
+        assert tLast >= 0;
         if (tLast > 0L)
         {
-            interArrivalTime = (value - tLast);
+            long interArrivalTime = (value - tLast);
+            if (interArrivalTime <= MAX_INTERVAL_IN_NANO)
+                arrivalIntervals.add(interArrivalTime);
+            else
+                logger.debug("Ignoring interval time of {} for {}", interArrivalTime, ep);
         }
         else
         {
-            interArrivalTime = Gossiper.intervalInMillis / 2;
+            // We use a very large initial interval since the "right" average depends on the cluster size
+            // and it's better to err high (false negatives, which will be corrected by waiting a bit longer)
+            // than low (false positives, which cause "flapping").
+            arrivalIntervals.add(FailureDetector.INITIAL_VALUE_NANOS);
         }
-        if (interArrivalTime <= MAX_INTERVAL_IN_MS)
-            arrivalIntervals.add(interArrivalTime);
-        else
-            logger.debug("Ignoring interval time of {}", interArrivalTime);
         tLast = value;
     }
 
@@ -290,24 +422,17 @@ class ArrivalWindow
         return arrivalIntervals.mean();
     }
 
-    void clear()
-    {
-        arrivalIntervals.clear();
-    }
-
     // see CASSANDRA-2597 for an explanation of the math at work here.
     double phi(long tnow)
     {
-        int size = arrivalIntervals.size();
-        double t = tnow - tLast;
-        return (size > 0)
-               ? PHI_FACTOR * t / mean()
-               : 0.0;
+        assert arrivalIntervals.mean() > 0 && tLast > 0; // should not be called before any samples arrive
+        long t = tnow - tLast;
+        return t / mean();
     }
 
     public String toString()
     {
-        return StringUtils.join(arrivalIntervals.iterator(), " ");
+        return Arrays.toString(arrivalIntervals.getArrivalIntervals());
     }
 }
 

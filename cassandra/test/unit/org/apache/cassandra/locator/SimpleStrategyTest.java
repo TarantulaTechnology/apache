@@ -1,22 +1,20 @@
 /*
-* Licensed to the Apache Software Foundation (ASF) under one
-* or more contributor license agreements.  See the NOTICE file
-* distributed with this work for additional information
-* regarding copyright ownership.  The ASF licenses this file
-* to you under the Apache License, Version 2.0 (the
-* "License"); you may not use this file except in compliance
-* with the License.  You may obtain a copy of the License at
-*
-*    http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing,
-* software distributed under the License is distributed on an
-* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-* KIND, either express or implied.  See the License for the
-* specific language governing permissions and limitations
-* under the License.
-*/
-
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package org.apache.cassandra.locator;
 
 import java.net.InetAddress;
@@ -26,30 +24,46 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 
-import org.apache.cassandra.config.Schema;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.dht.*;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.OrderPreservingPartitioner;
+import org.apache.cassandra.dht.OrderPreservingPartitioner.StringToken;
+import org.apache.cassandra.dht.RandomPartitioner.BigIntegerToken;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.service.PendingRangeCalculatorService;
 import org.apache.cassandra.service.StorageServiceAccessor;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
-public class SimpleStrategyTest extends SchemaLoader
+public class SimpleStrategyTest
 {
-    @Test
-    public void tryValidKeyspace()
+    public static final String KEYSPACE1 = "SimpleStrategyTest";
+
+    @BeforeClass
+    public static void defineSchema() throws Exception
     {
-        assert Keyspace.open("Keyspace1").getReplicationStrategy() != null;
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE1, KeyspaceParams.simple(1));
     }
 
     @Test
-    public void testBigIntegerEndpoints() throws UnknownHostException, ConfigurationException
+    public void tryValidKeyspace()
+    {
+        assert Keyspace.open(KEYSPACE1).getReplicationStrategy() != null;
+    }
+
+    @Test
+    public void testBigIntegerEndpoints() throws UnknownHostException
     {
         List<Token> endpointTokens = new ArrayList<Token>();
         List<Token> keyTokens = new ArrayList<Token>();
@@ -61,22 +75,22 @@ public class SimpleStrategyTest extends SchemaLoader
     }
 
     @Test
-    public void testStringEndpoints() throws UnknownHostException, ConfigurationException
+    public void testStringEndpoints() throws UnknownHostException
     {
-        IPartitioner partitioner = new OrderPreservingPartitioner();
+        IPartitioner partitioner = OrderPreservingPartitioner.instance;
 
         List<Token> endpointTokens = new ArrayList<Token>();
         List<Token> keyTokens = new ArrayList<Token>();
         for (int i = 0; i < 5; i++) {
             endpointTokens.add(new StringToken(String.valueOf((char)('a' + i * 2))));
-            keyTokens.add(partitioner.getToken(ByteBufferUtil.bytes(String.valueOf((char)('a' + i * 2 + 1)))));
+            keyTokens.add(partitioner.getToken(ByteBufferUtil.bytes(String.valueOf((char) ('a' + i * 2 + 1)))));
         }
         verifyGetNaturalEndpoints(endpointTokens.toArray(new Token[0]), keyTokens.toArray(new Token[0]));
     }
 
     // given a list of endpoint tokens, and a set of key tokens falling between the endpoint tokens,
     // make sure that the Strategy picks the right endpoints for the keys.
-    private void verifyGetNaturalEndpoints(Token[] endpointTokens, Token[] keyTokens) throws UnknownHostException, ConfigurationException
+    private void verifyGetNaturalEndpoints(Token[] endpointTokens, Token[] keyTokens) throws UnknownHostException
     {
         TokenMetadata tmd;
         AbstractReplicationStrategy strategy;
@@ -105,7 +119,7 @@ public class SimpleStrategyTest extends SchemaLoader
     }
 
     @Test
-    public void testGetEndpointsDuringBootstrap() throws UnknownHostException, ConfigurationException
+    public void testGetEndpointsDuringBootstrap() throws UnknownHostException
     {
         // the token difference will be RING_SIZE * 2.
         final int RING_SIZE = 10;
@@ -139,7 +153,7 @@ public class SimpleStrategyTest extends SchemaLoader
         {
             strategy = getStrategy(keyspaceName, tmd);
 
-            StorageService.calculatePendingRanges(strategy, keyspaceName);
+            PendingRangeCalculatorService.calculatePendingRanges(strategy, keyspaceName);
 
             int replicationFactor = strategy.getReplicationFactor();
 
@@ -165,14 +179,14 @@ public class SimpleStrategyTest extends SchemaLoader
         StorageServiceAccessor.setTokenMetadata(oldTmd);
     }
 
-    private AbstractReplicationStrategy getStrategy(String keyspaceName, TokenMetadata tmd) throws ConfigurationException
+    private AbstractReplicationStrategy getStrategy(String keyspaceName, TokenMetadata tmd)
     {
-        KSMetaData ksmd = Schema.instance.getKSMetaData(keyspaceName);
+        KeyspaceMetadata ksmd = Schema.instance.getKSMetaData(keyspaceName);
         return AbstractReplicationStrategy.createReplicationStrategy(
-                keyspaceName,
-                ksmd.strategyClass,
-                tmd,
-                new SimpleSnitch(),
-                ksmd.strategyOptions);
+                                                                    keyspaceName,
+                                                                    ksmd.params.replication.klass,
+                                                                    tmd,
+                                                                    new SimpleSnitch(),
+                                                                    ksmd.params.replication.options);
     }
 }

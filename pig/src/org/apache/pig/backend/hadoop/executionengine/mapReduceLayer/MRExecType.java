@@ -22,7 +22,6 @@ import java.util.Properties;
 
 import org.apache.pig.ExecType;
 import org.apache.pig.backend.executionengine.ExecutionEngine;
-import org.apache.pig.backend.hadoop.executionengine.MRExecutionEngine;
 import org.apache.pig.impl.PigContext;
 
 /**
@@ -32,7 +31,7 @@ import org.apache.pig.impl.PigContext;
 public class MRExecType implements ExecType {
 
     private static final long serialVersionUID = 1L;
-    private static final String[] modes = { "MAPREDUCE", "MAPRED" };
+    private static final String[] modes = { "MAPREDUCE", "MAPRED", "MR" };
 
     @Override
     public boolean accepts(Properties properties) {

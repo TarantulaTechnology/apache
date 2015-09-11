@@ -25,18 +25,21 @@ import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.util.HashMap;
 
-import junit.framework.TestCase;
 
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.server.quorum.QuorumPeer;
 import org.apache.zookeeper.server.quorum.QuorumPeer.QuorumServer;
+import org.junit.After;
+import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.runner.JUnitCore;
 
 @Ignore("No tests in this class.")
-public class BaseSysTest extends TestCase {
+public class BaseSysTest {
+    private static final File testData = new File(
+            System.getProperty("test.data.dir", "build/test/data"));
     private static int fakeBasePort = 33222;
     private static String zkHostPort;
     protected String prefix = "/sysTest";
@@ -49,16 +52,18 @@ public class BaseSysTest extends TestCase {
         }
     }
     InstanceManager im;
-    @Override
-    protected void setUp() throws Exception {
+    @Before
+    public void setUp() throws Exception {
         if (!fakeMachines) {
             zk = new ZooKeeper(zkHostPort, 15000, new Watcher() {public void process(WatchedEvent e){}});
             im = new InstanceManager(zk, prefix);
         }
     }
-    @Override
-    protected void tearDown() throws Exception {
-        im.close();
+    @After
+    public void tearDown() throws Exception {
+        if (null != im) {
+            im.close();
+        }
     }
 
     int serverCount = defaultServerCount;
@@ -124,8 +129,9 @@ public class BaseSysTest extends TestCase {
                     sbClient.append(',');
                     sbServer.append(',');
                 }
-                sbClient.append(r[0]);
-                sbServer.append(r[1]);
+                sbClient.append(r[0]); // r[0] == "host:clientPort"
+                sbServer.append(r[1]); // r[1] == "host:leaderPort:leaderElectionPort"
+                sbServer.append(";"+(r[0].split(":"))[1]); // Appending ";clientPort"
             }
             serverHostPort = sbClient.toString();
             quorumHostPort = sbServer.toString();
@@ -144,11 +150,18 @@ public class BaseSysTest extends TestCase {
         qps = new QuorumPeer[count];
         qpsDirs = new File[count];
         for(int i = 1; i <= count; i++) {
-            peers.put(Long.valueOf(i), new QuorumServer(i, new InetSocketAddress("127.0.0.1", fakeBasePort + i)));
+            InetSocketAddress peerAddress = new InetSocketAddress("127.0.0.1",
+                    fakeBasePort + i);
+            InetSocketAddress electionAddr = new InetSocketAddress("127.0.0.1",
+                    serverCount + fakeBasePort + i);
+            peers.put(Long.valueOf(i), new QuorumServer(i, peerAddress,
+                    electionAddr));
         }
         StringBuilder sb = new StringBuilder();
         for(int i = 0; i < count; i++) {
-            qpsDirs[i] = File.createTempFile("sysTest", ".tmp");
+            //make that testData exists otherwise it fails on windows
+            testData.mkdirs();
+            qpsDirs[i] = File.createTempFile("sysTest", ".tmp", testData);
             qpsDirs[i].delete();
             qpsDirs[i].mkdir();
             int port = fakeBasePort+10+i;

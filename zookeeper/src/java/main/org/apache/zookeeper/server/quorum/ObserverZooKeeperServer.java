@@ -38,11 +38,12 @@ public class ObserverZooKeeperServer extends LearnerZooKeeperServer {
     private static final Logger LOG =
         LoggerFactory.getLogger(ObserverZooKeeperServer.class);        
     
-    /*
-     * Request processors
+    /**
+     * Enable since request processor for writing txnlog to disk and
+     * take periodic snapshot. Default is ON.
      */
-    private CommitProcessor commitProcessor;
-    private SyncRequestProcessor syncProcessor;
+    
+    private boolean syncRequestProcessorEnabled = this.self.getSyncEnabled();
     
     /*
      * Pending sync requests
@@ -52,6 +53,7 @@ public class ObserverZooKeeperServer extends LearnerZooKeeperServer {
 
     ObserverZooKeeperServer(FileTxnSnapLog logFactory, QuorumPeer self, ZKDatabase zkDb) throws IOException {
         super(logFactory, self.tickTime, self.minSessionTimeout, self.maxSessionTimeout, zkDb, self);
+        LOG.info("syncEnabled =" + syncRequestProcessorEnabled);
     }
     
     public Observer getObserver() {
@@ -72,6 +74,10 @@ public class ObserverZooKeeperServer extends LearnerZooKeeperServer {
      * @param request
      */
     public void commitRequest(Request request) {     
+        if (syncRequestProcessorEnabled) {
+            // Write to txnlog and take periodic snapshot
+            syncProcessor.processRequest(request);
+        }
         commitProcessor.commit(request);        
     }
     
@@ -86,15 +92,26 @@ public class ObserverZooKeeperServer extends LearnerZooKeeperServer {
         // Currently, they behave almost exactly the same as followers.
         RequestProcessor finalProcessor = new FinalRequestProcessor(this);
         commitProcessor = new CommitProcessor(finalProcessor,
-                Long.toString(getServerId()), true);
+                Long.toString(getServerId()), true,
+                getZooKeeperServerListener());
         commitProcessor.start();
         firstProcessor = new ObserverRequestProcessor(this, commitProcessor);
         ((ObserverRequestProcessor) firstProcessor).start();
-        syncProcessor = new SyncRequestProcessor(this,
-                new SendAckRequestProcessor(getObserver()));
-        syncProcessor.start();
+
+        /*
+         * Observer should write to disk, so that the it won't request
+         * too old txn from the leader which may lead to getting an entire
+         * snapshot.
+         *
+         * However, this may degrade performance as it has to write to disk
+         * and do periodic snapshot which may double the memory requirements
+         */
+        if (syncRequestProcessorEnabled) {
+            syncProcessor = new SyncRequestProcessor(this, null);
+            syncProcessor.start();
+        }
     }
-    
+
     /*
      * Process a sync request
      */
@@ -112,4 +129,16 @@ public class ObserverZooKeeperServer extends LearnerZooKeeperServer {
     public String getState() {
         return "observer";
     };    
+
+    @Override
+    public synchronized void shutdown() {
+        if (!isRunning()) {
+            LOG.debug("ZooKeeper server is not running, so not proceeding to shutdown!");
+            return;
+        }
+        super.shutdown();
+        if (syncRequestProcessorEnabled && syncProcessor != null) {
+            syncProcessor.shutdown();
+        }
+    }
 }

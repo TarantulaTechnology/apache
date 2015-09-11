@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <iostream>
+#include <unistd.h> // needed for _POSIX_MONOTONIC_CLOCK
 #include <stdarg.h>
 
 #include "Util.h"
@@ -147,7 +148,7 @@ Mock_calloc* Mock_calloc::mock_=0;
 // realloc
 
 #ifndef USING_DUMA
-void* realloc(void* p, size_t s){
+DECLARE_WRAPPER(void*,realloc,(void* p, size_t s)){
     if(!Mock_realloc::mock_)
         return LIBC_SYMBOLS.realloc(p,s);
     return Mock_realloc::mock_->call(p,s);
@@ -310,6 +311,17 @@ int poll(struct pollfd *fds, POLL_NFDS_TYPE nfds, int timeout){
     
 }
 
+/*
+ * Recent gcc with -O2 and glibc FORTIFY feature may cause our poll
+ * mock to be ignored.
+ */
+#if __USE_FORTIFY_LEVEL > 0
+int __poll_chk (struct pollfd *__fds, nfds_t __nfds, int __timeout,
+                __SIZE_TYPE__ __fdslen) {
+    return poll(__fds, __nfds, __timeout);
+}
+#endif
+
 // *****************************************************************************
 // gettimeofday
 int gettimeofday(struct timeval *tp, GETTIMEOFDAY_ARG2_TYPE tzp){
@@ -320,3 +332,16 @@ int gettimeofday(struct timeval *tp, GETTIMEOFDAY_ARG2_TYPE tzp){
 
 Mock_gettimeofday* Mock_gettimeofday::mock_=0;
 
+// *****************************************************************************
+#ifdef _POSIX_MONOTONIC_CLOCK
+// clock_gettime
+int clock_gettime(clockid_t id, struct timespec *tp) {
+    if (!Mock_gettimeofday::mock_)
+        return LIBC_SYMBOLS.clock_gettime(id,tp);
+    struct timeval tv = { 0 };
+    int res = Mock_gettimeofday::mock_->call(&tv, NULL);
+    tp->tv_sec = tv.tv_sec;
+    tp->tv_nsec = tv.tv_usec * 1000;
+    return res;
+}
+#endif

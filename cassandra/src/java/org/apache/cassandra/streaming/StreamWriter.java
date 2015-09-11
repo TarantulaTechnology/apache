@@ -20,19 +20,18 @@ package org.apache.cassandra.streaming;
 import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
-import java.nio.channels.Channels;
-import java.nio.channels.WritableByteChannel;
 import java.util.Collection;
 
-import com.google.common.util.concurrent.RateLimiter;
 import com.ning.compress.lzf.LZFOutputStream;
 
 import org.apache.cassandra.io.sstable.Component;
-import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.DataIntegrityMetadata;
 import org.apache.cassandra.io.util.DataIntegrityMetadata.ChecksumValidator;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.streaming.StreamManager.StreamRateLimiter;
 import org.apache.cassandra.utils.Pair;
 
 /**
@@ -44,7 +43,7 @@ public class StreamWriter
 
     protected final SSTableReader sstable;
     protected final Collection<Pair<Long, Long>> sections;
-    protected final RateLimiter limiter = StreamManager.getRateLimiter();
+    protected final StreamRateLimiter limiter;
     protected final StreamSession session;
 
     private OutputStream compressedOutput;
@@ -57,6 +56,7 @@ public class StreamWriter
         this.session = session;
         this.sstable = sstable;
         this.sections = sections;
+        this.limiter =  StreamManager.getRateLimiter(session.peer);
     }
 
     /**
@@ -64,30 +64,30 @@ public class StreamWriter
      *
      * StreamWriter uses LZF compression on wire to decrease size to transfer.
      *
-     * @param channel where this writes data to
+     * @param output where this writes data to
      * @throws IOException on any I/O error
      */
-    public void write(WritableByteChannel channel) throws IOException
+    public void write(DataOutputStreamPlus output) throws IOException
     {
         long totalSize = totalSize();
-        RandomAccessReader file = sstable.openDataReader();
-        ChecksumValidator validator = null;
-        if (new File(sstable.descriptor.filenameFor(Component.CRC)).exists())
-            validator = DataIntegrityMetadata.checksumValidator(sstable.descriptor);
 
-        transferBuffer = validator == null ? new byte[DEFAULT_CHUNK_SIZE] : new byte[validator.chunkSize];
 
-        // setting up data compression stream
-        compressedOutput = new LZFOutputStream(Channels.newOutputStream(channel));
-        long progress = 0L;
-
-        try
+        try(RandomAccessReader file = sstable.openDataReader();
+            ChecksumValidator validator = new File(sstable.descriptor.filenameFor(Component.CRC)).exists()
+                                          ? DataIntegrityMetadata.checksumValidator(sstable.descriptor)
+                                          : null;)
         {
+            transferBuffer = validator == null ? new byte[DEFAULT_CHUNK_SIZE] : new byte[validator.chunkSize];
+
+            // setting up data compression stream
+            compressedOutput = new LZFOutputStream(output);
+            long progress = 0L;
+
             // stream each of the required sections of the file
             for (Pair<Long, Long> section : sections)
             {
                 long start = validator == null ? section.left : validator.chunkStart(section.left);
-                int skipBytes = (int) (section.left - start);
+                int readOffset = (int) (section.left - start);
                 // seek to the beginning of the section
                 file.seek(start);
                 if (validator != null)
@@ -96,28 +96,20 @@ public class StreamWriter
                 // length of the section to read
                 long length = section.right - start;
                 // tracks write progress
-                long bytesTransferred = 0;
-                while (bytesTransferred < length)
+                long bytesRead = 0;
+                while (bytesRead < length)
                 {
-                    long lastWrite = write(file, validator, skipBytes, length, bytesTransferred);
-                    bytesTransferred += lastWrite;
-                    progress += lastWrite;
+                    long lastBytesRead = write(file, validator, readOffset, length, bytesRead);
+                    bytesRead += lastBytesRead;
+                    progress += (lastBytesRead - readOffset);
                     session.progress(sstable.descriptor, ProgressInfo.Direction.OUT, progress, totalSize);
-                    skipBytes = 0;
+                    readOffset = 0;
                 }
 
-                // make sure that current section is send
+                // make sure that current section is sent
                 compressedOutput.flush();
             }
         }
-        finally
-        {
-            // no matter what happens close file
-            FileUtils.closeQuietly(file);
-        }
-
-        // release reference only when completed successfully
-        sstable.releaseReference();
     }
 
     protected long totalSize()
@@ -134,10 +126,10 @@ public class StreamWriter
      * @param reader The file reader to read from
      * @param validator validator to verify data integrity
      * @param start number of bytes to skip transfer, but include for validation.
-     * @param length The full length that should be transferred
-     * @param bytesTransferred Number of bytes remaining to transfer
+     * @param length The full length that should be read from {@code reader}
+     * @param bytesTransferred Number of bytes already read out of {@code length}
      *
-     * @return Number of bytes transferred
+     * @return Number of bytes read
      *
      * @throws java.io.IOException on any I/O error
      */
@@ -150,7 +142,7 @@ public class StreamWriter
         if (validator != null)
             validator.validate(transferBuffer, 0, minReadable);
 
-        limiter.acquire(toTransfer);
+        limiter.acquire(toTransfer - start);
         compressedOutput.write(transferBuffer, start, (toTransfer - start));
 
         return toTransfer;

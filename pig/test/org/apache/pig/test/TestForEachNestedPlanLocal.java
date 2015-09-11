@@ -19,7 +19,6 @@
 package org.apache.pig.test;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -30,7 +29,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Random;
 
-import org.apache.pig.ExecType;
 import org.apache.pig.PigServer;
 import org.apache.pig.data.Tuple;
 import org.apache.pig.test.utils.TestHelper;
@@ -41,7 +39,7 @@ public class TestForEachNestedPlanLocal {
     private PigServer pig ;
 
     public TestForEachNestedPlanLocal() throws Throwable {
-        pig = new PigServer(ExecType.LOCAL) ;
+        pig = new PigServer(Util.getLocalTestMode()) ;
     }
 
     Boolean[] nullFlags = new Boolean[]{ false, true };
@@ -52,7 +50,7 @@ public class TestForEachNestedPlanLocal {
             System.err.println("Running testInnerOrderBy with nullFlags set to :" + nullFlags[i]);
             File tmpFile = genDataSetFile1(nullFlags[i]);
             pig.registerQuery("a = load '"
-                    + Util.generateURI(Util.encodeEscape(tmpFile.toString()), pig.getPigContext())
+                    + Util.generateURI(tmpFile.toString(), pig.getPigContext())
                     + "'; ");
             pig.registerQuery("b = group a by $0; ");
             pig.registerQuery("c = foreach b { " + "     c1 = order $1 by *; "
@@ -73,25 +71,15 @@ public class TestForEachNestedPlanLocal {
     public void testInnerLimit() throws Exception {
         File tmpFile = genDataSetFileOneGroup();
         pig.registerQuery("a = load '"
-                + Util.generateURI(Util.encodeEscape(tmpFile.toString()), pig.getPigContext())
+                + Util.generateURI(tmpFile.toString(), pig.getPigContext())
                 + "'; ");
         pig.registerQuery("b = group a by $0; ");
         pig.registerQuery("c = foreach b { " + "     c1 = limit $1 5; "
                 + "    generate COUNT(c1); " + "};");
         Iterator<Tuple> it = pig.openIterator("c");
-        Tuple t = null;
-        long count[] = new long[3];
-        for (int i = 0; i < 3 && it.hasNext(); i++) {
-            t = it.next();
-            count[i] = (Long)t.get(0);
-        }
+        List<Tuple> expected = Util.getTuplesFromConstantTupleStrings(new String[] {"(5L)", "(5L)", "(3L)" });
 
-        assertFalse(it.hasNext());
-
-        // Pig's previous local mode was screwed up correcting that
-        assertEquals(5L, count[0]);
-        assertEquals(5L, count[1]);
-        assertEquals(3L, count[2]);
+        Util.checkQueryOutputsAfterSort(it, expected);
     }
 
     @Test

@@ -21,116 +21,204 @@ import java.nio.ByteBuffer;
 import java.util.*;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Function;
 import com.google.common.base.Objects;
-import com.google.common.collect.Maps;
+import com.google.common.collect.Collections2;
 
-import org.apache.cassandra.cql3.ColumnNameBuilder;
-import org.apache.cassandra.cql3.QueryProcessor;
-import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.marshal.*;
-import org.apache.cassandra.exceptions.*;
-import org.apache.cassandra.thrift.ColumnDef;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.serializers.MarshalException;
 
-import static org.apache.cassandra.utils.FBUtilities.json;
-
-public class ColumnDefinition
+public class ColumnDefinition extends ColumnSpecification implements Comparable<ColumnDefinition>
 {
-    // system.schema_columns column names
-    private static final String COLUMN_NAME = "column_name";
-    private static final String VALIDATOR = "validator";
-    private static final String INDEX_TYPE = "index_type";
-    private static final String INDEX_OPTIONS = "index_options";
-    private static final String INDEX_NAME = "index_name";
-    private static final String COMPONENT_INDEX = "component_index";
-    private static final String TYPE = "type";
+    public static final Comparator<Object> asymmetricColumnDataComparator = (a, b) -> ((ColumnData) a).column().compareTo((ColumnDefinition) b);
 
     /*
      * The type of CQL3 column this definition represents.
-     * There is 3 main type of CQL3 columns: those parts of the partition key,
-     * those parts of the clustering key and the other, regular ones.
-     * But when COMPACT STORAGE is used, there is by design only one regular
-     * column, whose name is not stored in the data contrarily to the column of
-     * type REGULAR. Hence the COMPACT_VALUE type to distinguish it below.
+     * There is 4 main type of CQL3 columns: those parts of the partition key,
+     * those parts of the clustering columns and amongst the others, regular and
+     * static ones.
      *
-     * Note that thrift/CQL2 only know about definitions of type REGULAR (and
+     * Note that thrift only knows about definitions of type REGULAR (and
      * the ones whose componentIndex == null).
      */
-    public enum Type
+    public enum Kind
     {
         PARTITION_KEY,
-        CLUSTERING_KEY,
+        CLUSTERING,
         REGULAR,
-        COMPACT_VALUE
+        STATIC;
+
+        public boolean isPrimaryKeyKind()
+        {
+            return this == PARTITION_KEY || this == CLUSTERING;
+        }
+
     }
 
-    public final ByteBuffer name;
-    private AbstractType<?> validator;
-    private IndexType indexType;
-    private Map<String,String> indexOptions;
-    private String indexName;
-    public final Type type;
+    public final Kind kind;
 
     /*
      * If the column comparator is a composite type, indicates to which
      * component this definition refers to. If null, the definition refers to
      * the full column name.
      */
-    public final Integer componentIndex;
+    private final Integer componentIndex;
 
-    public static ColumnDefinition partitionKeyDef(ByteBuffer name, AbstractType<?> validator, Integer componentIndex)
+    private final Comparator<CellPath> cellPathComparator;
+    private final Comparator<Object> asymmetricCellPathComparator;
+    private final Comparator<? super Cell> cellComparator;
+
+    /**
+     * These objects are compared frequently, so we encode several of their comparison components
+     * into a single int value so that this can be done efficiently
+     */
+    private final int comparisonOrder;
+
+    private static int comparisonOrder(Kind kind, boolean isComplex, int position)
     {
-        return new ColumnDefinition(name, validator, componentIndex, Type.PARTITION_KEY);
+        return (kind.ordinal() << 28) | (isComplex ? 1 << 27 : 0) | position;
     }
 
-    public static ColumnDefinition clusteringKeyDef(ByteBuffer name, AbstractType<?> validator, Integer componentIndex)
+    public static ColumnDefinition partitionKeyDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator, Integer componentIndex)
     {
-        return new ColumnDefinition(name, validator, componentIndex, Type.CLUSTERING_KEY);
+        return new ColumnDefinition(cfm, name, validator, componentIndex, Kind.PARTITION_KEY);
     }
 
-    public static ColumnDefinition regularDef(ByteBuffer name, AbstractType<?> validator, Integer componentIndex)
+    public static ColumnDefinition partitionKeyDef(String ksName, String cfName, String name, AbstractType<?> validator, Integer componentIndex)
     {
-        return new ColumnDefinition(name, validator, componentIndex, Type.REGULAR);
+        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true), validator, componentIndex, Kind.PARTITION_KEY);
     }
 
-    public static ColumnDefinition compactValueDef(ByteBuffer name, AbstractType<?> validator)
+    public static ColumnDefinition clusteringKeyDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator, Integer componentIndex)
     {
-        return new ColumnDefinition(name, validator, null, Type.COMPACT_VALUE);
+        return new ColumnDefinition(cfm, name, validator, componentIndex, Kind.CLUSTERING);
     }
 
-    public ColumnDefinition(ByteBuffer name, AbstractType<?> validator, Integer componentIndex, Type type)
+    public static ColumnDefinition clusteringKeyDef(String ksName, String cfName, String name, AbstractType<?> validator, Integer componentIndex)
     {
-        this(name, validator, null, null, null, componentIndex, type);
+        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true),  validator, componentIndex, Kind.CLUSTERING);
+    }
+
+    public static ColumnDefinition regularDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator)
+    {
+        return new ColumnDefinition(cfm, name, validator, null, Kind.REGULAR);
+    }
+
+    public static ColumnDefinition regularDef(String ksName, String cfName, String name, AbstractType<?> validator)
+    {
+        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true), validator, null, Kind.REGULAR);
+    }
+
+    public static ColumnDefinition staticDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator)
+    {
+        return new ColumnDefinition(cfm, name, validator, null, Kind.STATIC);
+    }
+
+    public ColumnDefinition(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator, Integer componentIndex, Kind kind)
+    {
+        this(cfm.ksName,
+             cfm.cfName,
+             ColumnIdentifier.getInterned(name, cfm.getColumnDefinitionNameComparator(kind)),
+             validator,
+             componentIndex,
+             kind);
     }
 
     @VisibleForTesting
-    public ColumnDefinition(ByteBuffer name,
+    public ColumnDefinition(String ksName,
+                            String cfName,
+                            ColumnIdentifier name,
                             AbstractType<?> validator,
-                            IndexType indexType,
-                            Map<String, String> indexOptions,
-                            String indexName,
                             Integer componentIndex,
-                            Type type)
+                            Kind kind)
     {
-        assert name != null && validator != null;
-        this.name = name;
-        this.indexName = indexName;
-        this.validator = validator;
+        super(ksName, cfName, name, validator);
+        assert name != null && validator != null && kind != null;
+        assert name.isInterned();
+        assert componentIndex == null || kind.isPrimaryKeyKind(); // The componentIndex really only make sense for partition and clustering columns,
+                                                                  // so make sure we don't sneak it for something else since it'd breaks equals()
+        this.kind = kind;
         this.componentIndex = componentIndex;
-        this.setIndexType(indexType, indexOptions);
-        this.type = type;
+        this.cellPathComparator = makeCellPathComparator(kind, validator);
+        this.cellComparator = cellPathComparator == null ? ColumnData.comparator : (a, b) -> cellPathComparator.compare(a.path(), b.path());
+        this.asymmetricCellPathComparator = cellPathComparator == null ? null : (a, b) -> cellPathComparator.compare(((Cell)a).path(), (CellPath) b);
+        this.comparisonOrder = comparisonOrder(kind, isComplex(), position());
+    }
+
+    private static Comparator<CellPath> makeCellPathComparator(Kind kind, AbstractType<?> validator)
+    {
+        if (kind.isPrimaryKeyKind() || !validator.isCollection() || !validator.isMultiCell())
+            return null;
+
+        final CollectionType type = (CollectionType)validator;
+        return new Comparator<CellPath>()
+        {
+            public int compare(CellPath path1, CellPath path2)
+            {
+                if (path1.size() == 0 || path2.size() == 0)
+                {
+                    if (path1 == CellPath.BOTTOM)
+                        return path2 == CellPath.BOTTOM ? 0 : -1;
+                    if (path1 == CellPath.TOP)
+                        return path2 == CellPath.TOP ? 0 : 1;
+                    return path2 == CellPath.BOTTOM ? 1 : -1;
+                }
+
+                // This will get more complicated once we have non-frozen UDT and nested collections
+                assert path1.size() == 1 && path2.size() == 1;
+                return type.nameComparator().compare(path1.get(0), path2.get(0));
+            }
+        };
     }
 
     public ColumnDefinition copy()
     {
-        return new ColumnDefinition(name, validator, indexType, indexOptions, indexName, componentIndex, type);
+        return new ColumnDefinition(ksName, cfName, name, type, componentIndex, kind);
     }
 
-    public ColumnDefinition cloneWithNewName(ByteBuffer newName)
+    public ColumnDefinition withNewName(ColumnIdentifier newName)
     {
-        return new ColumnDefinition(newName, validator, indexType, indexOptions, indexName, componentIndex, type);
+        return new ColumnDefinition(ksName, cfName, newName, type, componentIndex, kind);
+    }
+
+    public ColumnDefinition withNewType(AbstractType<?> newType)
+    {
+        return new ColumnDefinition(ksName, cfName, name, newType, componentIndex, kind);
+    }
+
+    public boolean isOnAllComponents()
+    {
+        return componentIndex == null;
+    }
+
+    public boolean isPartitionKey()
+    {
+        return kind == Kind.PARTITION_KEY;
+    }
+
+    public boolean isClusteringColumn()
+    {
+        return kind == Kind.CLUSTERING;
+    }
+
+    public boolean isStatic()
+    {
+        return kind == Kind.STATIC;
+    }
+
+    public boolean isRegular()
+    {
+        return kind == Kind.REGULAR;
+    }
+
+    // The componentIndex. This never return null however for convenience sake:
+    // if componentIndex == null, this return 0. So caller should first check
+    // isOnAllComponents() to distinguish if that's a possibility.
+    public int position()
+    {
+        return componentIndex == null ? 0 : componentIndex;
     }
 
     @Override
@@ -144,238 +232,154 @@ public class ColumnDefinition
 
         ColumnDefinition cd = (ColumnDefinition) o;
 
-        return Objects.equal(name, cd.name)
-            && Objects.equal(validator, cd.validator)
-            && Objects.equal(componentIndex, cd.componentIndex)
-            && Objects.equal(indexName, cd.indexName)
-            && Objects.equal(indexType, cd.indexType)
-            && Objects.equal(indexOptions, cd.indexOptions);
+        return Objects.equal(ksName, cd.ksName)
+            && Objects.equal(cfName, cd.cfName)
+            && Objects.equal(name, cd.name)
+            && Objects.equal(type, cd.type)
+            && Objects.equal(kind, cd.kind)
+            && Objects.equal(componentIndex, cd.componentIndex);
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hashCode(name, validator, componentIndex, indexName, indexType, indexOptions);
+        return Objects.hashCode(ksName, cfName, name, type, kind, componentIndex);
     }
 
     @Override
     public String toString()
     {
         return Objects.toStringHelper(this)
-                      .add("name", ByteBufferUtil.bytesToHex(name))
-                      .add("validator", validator)
+                      .add("name", name)
                       .add("type", type)
+                      .add("kind", kind)
                       .add("componentIndex", componentIndex)
-                      .add("indexName", indexName)
-                      .add("indexType", indexType)
                       .toString();
     }
 
-    public boolean isThriftCompatible()
+    public boolean isPrimaryKeyColumn()
     {
-        return type == ColumnDefinition.Type.REGULAR && componentIndex == null;
-    }
-
-    public static List<ColumnDef> toThrift(Map<ByteBuffer, ColumnDefinition> columns)
-    {
-        List<ColumnDef> thriftDefs = new ArrayList<>(columns.size());
-        for (ColumnDefinition def : columns.values())
-            if (def.type == ColumnDefinition.Type.REGULAR)
-                thriftDefs.add(def.toThrift());
-        return thriftDefs;
-    }
-
-    public ColumnDef toThrift()
-    {
-        ColumnDef cd = new ColumnDef();
-
-        cd.setName(ByteBufferUtil.clone(name));
-        cd.setValidation_class(validator.toString());
-        cd.setIndex_type(indexType == null ? null : org.apache.cassandra.thrift.IndexType.valueOf(indexType.name()));
-        cd.setIndex_name(indexName == null ? null : indexName);
-        cd.setIndex_options(indexOptions == null ? null : Maps.newHashMap(indexOptions));
-
-        return cd;
-    }
-
-    public static ColumnDefinition fromThrift(ColumnDef thriftColumnDef, boolean isSuper) throws SyntaxException, ConfigurationException
-    {
-        // For super columns, the componentIndex is 1 because the ColumnDefinition applies to the column component.
-        return new ColumnDefinition(ByteBufferUtil.clone(thriftColumnDef.name),
-                                    TypeParser.parse(thriftColumnDef.validation_class),
-                                    thriftColumnDef.index_type == null ? null : IndexType.valueOf(thriftColumnDef.index_type.name()),
-                                    thriftColumnDef.index_options,
-                                    thriftColumnDef.index_name,
-                                    isSuper ? 1 : null,
-                                    Type.REGULAR);
-    }
-
-    public static Map<ByteBuffer, ColumnDefinition> fromThrift(List<ColumnDef> thriftDefs, boolean isSuper) throws SyntaxException, ConfigurationException
-    {
-        if (thriftDefs == null)
-            return new HashMap<>();
-
-        Map<ByteBuffer, ColumnDefinition> cds = new TreeMap<>();
-        for (ColumnDef thriftColumnDef : thriftDefs)
-            cds.put(ByteBufferUtil.clone(thriftColumnDef.name), fromThrift(thriftColumnDef, isSuper));
-
-        return cds;
+        return kind.isPrimaryKeyKind();
     }
 
     /**
-     * Drop specified column from the schema using given row.
-     *
-     * @param rm         The schema row mutation
-     * @param cfName     The name of the parent ColumnFamily
-     * @param timestamp  The timestamp to use for column modification
+     * Whether the name of this definition is serialized in the cell nane, i.e. whether
+     * it's not just a non-stored CQL metadata.
      */
-    public void deleteFromSchema(RowMutation rm, String cfName, long timestamp)
+    public boolean isPartOfCellName(boolean isCQL3Table, boolean isSuper)
     {
-        ColumnFamily cf = rm.addOrGet(CFMetaData.SchemaColumnsCf);
-        int ldt = (int) (System.currentTimeMillis() / 1000);
-
-        ColumnNameBuilder builder = CFMetaData.SchemaColumnsCf.getCfDef().getColumnNameBuilder();
-        builder.add(ByteBufferUtil.bytes(cfName)).add(name);
-        cf.addAtom(new RangeTombstone(builder.build(), builder.buildAsEndOfRange(), timestamp, ldt));
-    }
-
-    public void toSchema(RowMutation rm, String cfName, AbstractType<?> comparator, long timestamp)
-    {
-        ColumnFamily cf = rm.addOrGet(CFMetaData.SchemaColumnsCf);
-        int ldt = (int) (System.currentTimeMillis() / 1000);
-
-        cf.addColumn(Column.create("", timestamp, cfName, comparator.getString(name), ""));
-        cf.addColumn(Column.create(validator.toString(), timestamp, cfName, comparator.getString(name), VALIDATOR));
-        cf.addColumn(indexType == null ? DeletedColumn.create(ldt, timestamp, cfName, comparator.getString(name), INDEX_TYPE)
-                                       : Column.create(indexType.toString(), timestamp, cfName, comparator.getString(name), INDEX_TYPE));
-        cf.addColumn(indexOptions == null ? DeletedColumn.create(ldt, timestamp, cfName, comparator.getString(name), INDEX_OPTIONS)
-                                          : Column.create(json(indexOptions), timestamp, cfName, comparator.getString(name), INDEX_OPTIONS));
-        cf.addColumn(indexName == null ? DeletedColumn.create(ldt, timestamp, cfName, comparator.getString(name), INDEX_NAME)
-                                       : Column.create(indexName, timestamp, cfName, comparator.getString(name), INDEX_NAME));
-        cf.addColumn(componentIndex == null ? DeletedColumn.create(ldt, timestamp, cfName, comparator.getString(name), COMPONENT_INDEX)
-                                            : Column.create(componentIndex, timestamp, cfName, comparator.getString(name), COMPONENT_INDEX));
-        cf.addColumn(Column.create(type.toString().toLowerCase(), timestamp, cfName, comparator.getString(name), TYPE));
-    }
-
-    public void apply(ColumnDefinition def, AbstractType<?> comparator)  throws ConfigurationException
-    {
-        assert type == def.type && Objects.equal(componentIndex, def.componentIndex);
-
-        if (getIndexType() != null && def.getIndexType() != null)
-        {
-            // If an index is set (and not drop by this update), the validator shouldn't be change to a non-compatible one
-            if (!def.getValidator().isCompatibleWith(getValidator()))
-                throw new ConfigurationException(String.format("Cannot modify validator to a non-compatible one for column %s since an index is set",
-                                                                comparator.getString(name)));
-
-            assert getIndexName() != null;
-            if (!getIndexName().equals(def.getIndexName()))
-                throw new ConfigurationException("Cannot modify index name");
-        }
-
-        setValidator(def.getValidator());
-        setIndexType(def.getIndexType(), def.getIndexOptions());
-        setIndexName(def.getIndexName());
+        // When converting CQL3 tables to thrift, any regular or static column ends up in the cell name.
+        // When it's a compact table however, the REGULAR definition is the name for the cell value of "dynamic"
+        // column (so it's not part of the cell name) and it's static columns that ends up in the cell name.
+        if (isCQL3Table)
+            return kind == Kind.REGULAR || kind == Kind.STATIC;
+        else if (isSuper)
+            return kind == Kind.REGULAR;
+        else
+            return kind == Kind.STATIC;
     }
 
     /**
-     * Deserialize columns from storage-level representation
+     * Converts the specified column definitions into column identifiers.
      *
-     * @param serializedColumns storage-level partition containing the column definitions
-     * @return the list of processed ColumnDefinitions
+     * @param definitions the column definitions to convert.
+     * @return the column identifiers corresponding to the specified definitions
      */
-    public static List<ColumnDefinition> fromSchema(Row serializedColumns, CFMetaData cfm)
+    public static Collection<ColumnIdentifier> toIdentifiers(Collection<ColumnDefinition> definitions)
     {
-        List<ColumnDefinition> cds = new ArrayList<>();
-
-        String query = String.format("SELECT * FROM %s.%s", Keyspace.SYSTEM_KS, SystemKeyspace.SCHEMA_COLUMNS_CF);
-        for (UntypedResultSet.Row row : QueryProcessor.resultify(query, serializedColumns))
+        return Collections2.transform(definitions, new Function<ColumnDefinition, ColumnIdentifier>()
         {
-            Type type = row.has(TYPE)
-                      ? Enum.valueOf(Type.class, row.getString(TYPE).toUpperCase())
-                      : Type.REGULAR;
-
-            Integer componentIndex = null;
-            if (row.has(COMPONENT_INDEX))
-                componentIndex = row.getInt(COMPONENT_INDEX);
-            else if (type == Type.CLUSTERING_KEY && cfm.isSuper())
-                componentIndex = 1; // A ColumnDefinition for super columns applies to the column component
-
-            ByteBuffer name = cfm.getComponentComparator(componentIndex, type).fromString(row.getString(COLUMN_NAME));
-
-            AbstractType<?> validator;
-            try
+            @Override
+            public ColumnIdentifier apply(ColumnDefinition columnDef)
             {
-                validator = TypeParser.parse(row.getString(VALIDATOR));
+                return columnDef.name;
             }
-            catch (RequestValidationException e)
-            {
-                throw new RuntimeException(e);
-            }
-
-            IndexType indexType = null;
-            if (row.has(INDEX_TYPE))
-                indexType = IndexType.valueOf(row.getString(INDEX_TYPE));
-
-            Map<String, String> indexOptions = null;
-            if (row.has(INDEX_OPTIONS))
-                indexOptions = FBUtilities.fromJsonMap(row.getString(INDEX_OPTIONS));
-
-            String indexName = null;
-            if (row.has(INDEX_NAME))
-                indexName = row.getString(INDEX_NAME);
-
-            cds.add(new ColumnDefinition(name, validator, indexType, indexOptions, indexName, componentIndex, type));
-        }
-
-        return cds;
+        });
     }
 
-    public String getIndexName()
+    public int compareTo(ColumnDefinition other)
     {
-        return indexName;
+        if (this == other)
+            return 0;
+
+        if (comparisonOrder != other.comparisonOrder)
+            return comparisonOrder - other.comparisonOrder;
+
+        return this.name.compareTo(other.name);
     }
 
-    public ColumnDefinition setIndexName(String indexName)
+    public Comparator<CellPath> cellPathComparator()
     {
-        this.indexName = indexName;
-        return this;
+        return cellPathComparator;
     }
 
-    public ColumnDefinition setIndexType(IndexType indexType, Map<String,String> indexOptions)
+    public Comparator<Object> asymmetricCellPathComparator()
     {
-        this.indexType = indexType;
-        this.indexOptions = indexOptions;
-        return this;
+        return asymmetricCellPathComparator;
     }
 
-    public ColumnDefinition setIndex(String indexName, IndexType indexType, Map<String,String> indexOptions)
+    public Comparator<? super Cell> cellComparator()
     {
-        return setIndexName(indexName).setIndexType(indexType, indexOptions);
+        return cellComparator;
     }
 
-    public boolean isIndexed()
+    public boolean isComplex()
     {
-        return indexType != null;
+        return cellPathComparator != null;
     }
 
-    public IndexType getIndexType()
+    public boolean isSimple()
     {
-        return indexType;
+        return !isComplex();
     }
 
-    public Map<String,String> getIndexOptions()
+    public CellPath.Serializer cellPathSerializer()
     {
-        return indexOptions;
+        // Collections are our only complex so far, so keep it simple
+        return CollectionType.cellPathSerializer;
     }
 
-    public AbstractType<?> getValidator()
+    public void validateCellValue(ByteBuffer value)
     {
-        return validator;
+        type.validateCellValue(value);
     }
 
-    public void setValidator(AbstractType<?> validator)
+    public void validateCellPath(CellPath path)
     {
-        this.validator = validator;
+        if (!isComplex())
+            throw new MarshalException("Only complex cells should have a cell path");
+
+        assert type instanceof CollectionType;
+        ((CollectionType)type).nameComparator().validate(path.get(0));
+    }
+
+    public static String toCQLString(Iterable<ColumnDefinition> defs)
+    {
+        return toCQLString(defs.iterator());
+    }
+
+    public static String toCQLString(Iterator<ColumnDefinition> defs)
+    {
+        if (!defs.hasNext())
+            return "";
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(defs.next().name);
+        while (defs.hasNext())
+            sb.append(", ").append(defs.next().name);
+        return sb.toString();
+    }
+
+    /**
+     * The type of the cell values for cell belonging to this column.
+     *
+     * This is the same than the column type, except for collections where it's the 'valueComparator'
+     * of the collection.
+     */
+    public AbstractType<?> cellValueType()
+    {
+        return type instanceof CollectionType
+             ? ((CollectionType)type).valueComparator()
+             : type;
     }
 }

@@ -8,65 +8,51 @@ CREATE TABLE has_all_types (
     decimalcol decimal,
     doublecol double,
     floatcol float,
+    smallintcol smallint,
     textcol text,
     timestampcol timestamp,
+    tinyintcol tinyint,
     uuidcol uuid,
     varcharcol varchar,
     varintcol varint
 ) WITH compression = {'sstable_compression':'LZ4Compressor'};
 
 INSERT INTO has_all_types (num, intcol, asciicol, bigintcol, blobcol, booleancol,
-                           decimalcol, doublecol, floatcol, textcol,
-                           timestampcol, uuidcol, varcharcol, varintcol)
+                           decimalcol, doublecol, floatcol, smallintcol, textcol,
+                           timestampcol, tinyintcol, uuidcol, varcharcol, varintcol)
 VALUES (0, -12, 'abcdefg', 1234567890123456789, 0x000102030405fffefd, true,
-        19952.11882, 1.0, -2.1, 'Voilá!', '2012-05-14 12:53:20+0000',
-        bd1924e1-6af8-44ae-b5e1-f24131dbd460, '"', 10000000000000000000000000);
+        19952.11882, 1.0, -2.1, 32767, 'Voilá!',
+        '2012-05-14 12:53:20+0000', 127, bd1924e1-6af8-44ae-b5e1-f24131dbd460, '"', 10000000000000000000000000);
 
 INSERT INTO has_all_types (num, intcol, asciicol, bigintcol, blobcol, booleancol,
-                           decimalcol, doublecol, floatcol, textcol,
-                           timestampcol, uuidcol, varcharcol, varintcol)
+                           decimalcol, doublecol, floatcol, smallintcol, textcol,
+                           timestampcol, tinyintcol, uuidcol, varcharcol, varintcol)
 VALUES (1, 2147483647, '__!''$#@!~"', 9223372036854775807, 0xffffffffffffffffff, true,
-        0.00000000000001, 9999999.999, 99999.99, '∭Ƕ⑮ฑ➳❏''', '1900-01-01+0000',
-        ffffffff-ffff-ffff-ffff-ffffffffffff, 'newline->
+        0.00000000000001, 9999999.999, 99999.99, 32767, '∭Ƕ⑮ฑ➳❏''',
+        '1950-01-01+0000', 127, ffffffff-ffff-ffff-ffff-ffffffffffff, 'newline->
 <-', 9);
 
 INSERT INTO has_all_types (num, intcol, asciicol, bigintcol, blobcol, booleancol,
-                           decimalcol, doublecol, floatcol, textcol,
-                           timestampcol, uuidcol, varcharcol, varintcol)
+                           decimalcol, doublecol, floatcol, smallintcol, textcol,
+                           timestampcol, tinyintcol, uuidcol, varcharcol, varintcol)
 VALUES (2, 0, '', 0, 0x, false,
-        0.0, 0.0, 0.0, '', 0,
-        00000000-0000-0000-0000-000000000000, '', 0);
+        0.0, 0.0, 0.0, 0, '',
+        0, 0, 00000000-0000-0000-0000-000000000000, '', 0);
 
 INSERT INTO has_all_types (num, intcol, asciicol, bigintcol, blobcol, booleancol,
-                           decimalcol, doublecol, floatcol, textcol,
-                           timestampcol, uuidcol, varcharcol, varintcol)
+                           decimalcol, doublecol, floatcol, smallintcol, textcol,
+                           timestampcol, tinyintcol, uuidcol, varcharcol, varintcol)
 VALUES (3, -2147483648, '''''''', -9223372036854775808, 0x80, false,
-        10.0000000000000, -1004.10, 100000000.9, '龍馭鬱', '2038-01-19T03:14-1200',
-        ffffffff-ffff-1fff-8fff-ffffffffffff, '''', -10000000000000000000000000);
+        10.0000000000000, -1004.10, 100000000.9, 32767, '龍馭鬱',
+        '2038-01-19T03:14-1200', 127, ffffffff-ffff-1fff-8fff-ffffffffffff,
+	    '''', -10000000000000000000000000);
 
 INSERT INTO has_all_types (num, intcol, asciicol, bigintcol, blobcol, booleancol,
-                           decimalcol, doublecol, floatcol, textcol,
-                           timestampcol, uuidcol, varcharcol, varintcol)
-VALUES (4, blobAsInt(0x), '', blobAsBigint(0x), 0x, blobAsBoolean(0x), blobAsDecimal(0x),
-        blobAsDouble(0x), blobAsFloat(0x), '', blobAsTimestamp(0x), blobAsUuid(0x), '',
-        blobAsVarint(0x));
-
-
-CREATE TABLE has_value_encoding_errors (
-    pkey ascii PRIMARY KEY,
-    utf8col blob
-);
-
-INSERT INTO has_value_encoding_errors (pkey, utf8col) VALUES ('A', 0x00ff00ff);
-ALTER TABLE has_value_encoding_errors ALTER utf8col TYPE text;
-
-CREATE TABLE has_key_encoding_errors (
-    pkey blob PRIMARY KEY,
-    col text
-);
-
-INSERT INTO has_key_encoding_errors (pkey, col) VALUES (0x00ff028f, 'whatever');
-ALTER TABLE has_key_encoding_errors ALTER pkey TYPE text;
+                           decimalcol, doublecol, floatcol, smallintcol, textcol,
+                           timestampcol, tinyintcol, uuidcol, varcharcol, varintcol)
+VALUES (4, blobAsInt(0x), '', blobAsBigint(0x), 0x, blobAsBoolean(0x),
+	blobAsDecimal(0x), blobAsDouble(0x), blobAsFloat(0x), blobAsSmallInt(0x0000), '',
+	blobAsTimestamp(0x), blobAsTinyInt(0x00), blobAsUuid(0x), '', blobAsVarint(0x));
 
 
 
@@ -130,23 +116,19 @@ INSERT INTO undefined_values_table (k, c) VALUES ('k2', 'c2');
 
 
 
-CREATE TABLE ascii_with_invalid_and_special_chars (
+CREATE TABLE ascii_with_special_chars (
     k int PRIMARY KEY,
-    val blob
+    val ascii
 );
 
 -- "newline:\n"
-INSERT INTO ascii_with_invalid_and_special_chars (k, val) VALUES (0, 0x6e65776c696e653a0a);
+INSERT INTO ascii_with_special_chars (k, val) VALUES (0, blobAsAscii(0x6e65776c696e653a0a));
 -- "return\rand null\0!"
-INSERT INTO ascii_with_invalid_and_special_chars (k, val) VALUES (1, 0x72657475726e0d616e64206e756c6c0021);
+INSERT INTO ascii_with_special_chars (k, val) VALUES (1, blobAsAscii(0x72657475726e0d616e64206e756c6c0021));
 -- "\x00\x01\x02\x03\x04\x05control chars\x06\x07"
-INSERT INTO ascii_with_invalid_and_special_chars (k, val) VALUES (2, 0x000102030405636f6e74726f6c2063686172730607);
--- "\xfe\xffbyte order mark"
-INSERT INTO ascii_with_invalid_and_special_chars (k, val) VALUES (3, 0xfeff62797465206f72646572206d61726b);
+INSERT INTO ascii_with_special_chars (k, val) VALUES (2, blobAsAscii(0x000102030405636f6e74726f6c2063686172730607));
 -- "fake special chars\\x00\\n"
-INSERT INTO ascii_with_invalid_and_special_chars (k, val) VALUES (4, 0x66616b65207370656369616c2063686172735c7830305c6e);
-
-ALTER TABLE ascii_with_invalid_and_special_chars ALTER val TYPE ascii;
+INSERT INTO ascii_with_special_chars (k, val) VALUES (3, blobAsAscii(0x66616b65207370656369616c2063686172735c7830305c6e));
 
 
 
@@ -202,3 +184,77 @@ INSERT INTO twenty_rows_composite_table (a, b, c) VALUES ('A', '17', '17');
 INSERT INTO twenty_rows_composite_table (a, b, c) VALUES ('A', '18', '18');
 INSERT INTO twenty_rows_composite_table (a, b, c) VALUES ('A', '19', '19');
 INSERT INTO twenty_rows_composite_table (a, b, c) VALUES ('A', '20', '20');
+
+CREATE TYPE address (
+    city text,
+    address text,
+    zip text
+);
+
+CREATE TYPE phone_number (
+    country text,
+    number text
+);
+
+CREATE TABLE users (
+    login text PRIMARY KEY,
+    name text,
+    addresses set<frozen<address>>,
+    phone_numbers set<frozen<phone_number>>
+);
+
+insert into users (login, name, addresses, phone_numbers)
+values ('jbellis',
+        'jonathan ellis',
+        {{city: 'Austin', address: '902 East 5th St. #202', zip: '78702'},
+         {city: 'Sunnyvale', address: '292 Gibraltar Drive #107', zip: '94089'}},
+        {{country: '+44', number: '208 622 3021'},
+         {country: '+1', number: '512-537-7809'}});
+
+insert into users (login, name, addresses, phone_numbers)
+values ('vpupkin',
+        'vasya pupkin',
+        {{city: 'Chelyabinsk', address: '3rd street', zip: null},
+         {city: 'Chigirinsk', address: null, zip: '676722'}},
+        {{country: '+7', number: null},
+         {country: null, number: '03'}});
+
+CREATE TYPE band_info_type (
+  founded varint,
+  members set<text>,
+  description text
+);
+
+CREATE TYPE tags (
+  tags map<text, text>
+);
+
+CREATE TABLE songs (
+    title text PRIMARY KEY,
+    band text,
+    info frozen<band_info_type>,
+    tags frozen<tags>
+);
+
+insert into songs (title, band, info, tags)
+values (
+    'The trooper',
+    'Iron Maiden',
+    {
+        founded:188694000,
+        members: {
+            'Bruce Dickinson',
+            'Dave Murray',
+            'Adrian Smith',
+            'Janick Gers',
+            'Steve Harris',
+            'Nicko McBrain'
+        },
+        description: 'Pure evil metal'
+     },
+    {
+        tags: {
+            'genre':'metal',
+            'origin':'england'
+        }
+    });

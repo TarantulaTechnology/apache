@@ -18,16 +18,17 @@
 package org.apache.cassandra.io.sstable;
 
 import java.io.*;
-import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 
-import org.apache.cassandra.db.TypeSizes;
-import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.io.ISerializer;
+import org.apache.cassandra.io.sstable.format.Version;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.io.util.FileDataInput;
-import org.apache.cassandra.io.util.FileMark;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.*;
 
@@ -36,90 +37,26 @@ import org.apache.cassandra.utils.*;
  */
 public class IndexHelper
 {
-    public static void skipBloomFilter(DataInput in) throws IOException
-    {
-        int size = in.readInt();
-        FileUtils.skipBytesFully(in, size);
-    }
-
-    /**
-     * Skip the index
-     * @param in the data input from which the index should be skipped
-     * @throws IOException if an I/O error occurs.
-     */
-    public static void skipIndex(DataInput in) throws IOException
-    {
-        /* read only the column index list */
-        int columnIndexSize = in.readInt();
-        /* skip the column index data */
-        if (in instanceof FileDataInput)
-        {
-            FileUtils.skipBytesFully(in, columnIndexSize);
-        }
-        else
-        {
-            // skip bytes
-            byte[] skip = new byte[columnIndexSize];
-            in.readFully(skip);
-        }
-    }
-
-    /**
-     * Deserialize the index into a structure and return it
-     *
-     * @param in - input source
-     *
-     * @return ArrayList<IndexInfo> - list of de-serialized indexes
-     * @throws IOException if an I/O error occurs.
-     */
-    public static List<IndexInfo> deserializeIndex(FileDataInput in) throws IOException
-    {
-        int columnIndexSize = in.readInt();
-        if (columnIndexSize == 0)
-            return Collections.<IndexInfo>emptyList();
-        ArrayList<IndexInfo> indexList = new ArrayList<IndexInfo>();
-        FileMark mark = in.mark();
-        while (in.bytesPastMark(mark) < columnIndexSize)
-        {
-            indexList.add(IndexInfo.deserialize(in));
-        }
-        assert in.bytesPastMark(mark) == columnIndexSize;
-
-        return indexList;
-    }
-
     /**
      * The index of the IndexInfo in which a scan starting with @name should begin.
      *
-     * @param name
-     *         name of the index
-     *
-     * @param indexList
-     *          list of the indexInfo objects
-     *
-     * @param comparator
-     *          comparator type
-     *
-     * @param reversed
-     *          is name reversed
+     * @param name name to search for
+     * @param indexList list of the indexInfo objects
+     * @param comparator the comparator to use
+     * @param reversed whether or not the search is reversed, i.e. we scan forward or backward from name
+     * @param lastIndex where to start the search from in indexList
      *
      * @return int index
      */
-    public static int indexFor(ByteBuffer name, List<IndexInfo> indexList, AbstractType<?> comparator, boolean reversed, int lastIndex)
+    public static int indexFor(ClusteringPrefix name, List<IndexInfo> indexList, ClusteringComparator comparator, boolean reversed, int lastIndex)
     {
-        if (name.remaining() == 0 && reversed)
-            return indexList.size() - 1;
-
-        if (lastIndex >= indexList.size())
-            return -1;
-
-        IndexInfo target = new IndexInfo(name, name, 0, 0);
+        IndexInfo target = new IndexInfo(name, name, 0, null);
         /*
         Take the example from the unit test, and say your index looks like this:
         [0..5][10..15][20..25]
         and you look for the slice [13..17].
 
-        When doing forward slice, we we doing a binary search comparing 13 (the start of the query)
+        When doing forward slice, we are doing a binary search comparing 13 (the start of the query)
         to the lastName part of the index slot. You'll end up with the "first" slot, going from left to right,
         that may contain the start.
 
@@ -129,73 +66,120 @@ public class IndexHelper
         */
         int startIdx = 0;
         List<IndexInfo> toSearch = indexList;
-        if (lastIndex >= 0)
+        if (reversed)
         {
-            if (reversed)
+            if (lastIndex < indexList.size() - 1)
             {
                 toSearch = indexList.subList(0, lastIndex + 1);
             }
-            else
+        }
+        else
+        {
+            if (lastIndex > 0)
             {
                 startIdx = lastIndex;
                 toSearch = indexList.subList(lastIndex, indexList.size());
             }
         }
-        int index = Collections.binarySearch(toSearch, target, getComparator(comparator, reversed));
+        int index = Collections.binarySearch(toSearch, target, comparator.indexComparator(reversed));
         return startIdx + (index < 0 ? -index - (reversed ? 2 : 1) : index);
-    }
-
-    public static Comparator<IndexInfo> getComparator(final AbstractType<?> nameComparator, boolean reversed)
-    {
-        return reversed ? nameComparator.indexReverseComparator : nameComparator.indexComparator;
     }
 
     public static class IndexInfo
     {
-        public final long width;
-        public final ByteBuffer lastName;
-        public final ByteBuffer firstName;
-        public final long offset;
+        private static final long EMPTY_SIZE = ObjectSizes.measure(new IndexInfo(null, null, 0, null));
 
-        public IndexInfo(ByteBuffer firstName, ByteBuffer lastName, long offset, long width)
+        public final long width;
+        public final ClusteringPrefix firstName;
+        public final ClusteringPrefix lastName;
+
+        // If at the end of the index block there is an open range tombstone marker, this marker
+        // deletion infos. null otherwise.
+        public final DeletionTime endOpenMarker;
+
+        public IndexInfo(ClusteringPrefix firstName,
+                         ClusteringPrefix lastName,
+                         long width,
+                         DeletionTime endOpenMarker)
         {
             this.firstName = firstName;
             this.lastName = lastName;
-            this.offset = offset;
             this.width = width;
+            this.endOpenMarker = endOpenMarker;
         }
 
-        public void serialize(DataOutput out) throws IOException
+        public static class Serializer
         {
-            ByteBufferUtil.writeWithShortLength(firstName, out);
-            ByteBufferUtil.writeWithShortLength(lastName, out);
-            out.writeLong(offset);
-            out.writeLong(width);
+            // This is the default index size that we use to delta-encode width when serializing so we get better vint-encoding.
+            // This is imperfect as user can change the index size and ideally we would save the index size used with each index file
+            // to use as base. However, that's a bit more involved a change that we want for now and very seldom do use change the index
+            // size so using the default is almost surely better than using no base at all.
+            private static final long WIDTH_BASE = 64 * 1024;
+
+            // TODO: Only public for use in RowIndexEntry for backward compatibility code. Can be made private once backward compatibility is dropped.
+            public final ISerializer<ClusteringPrefix> clusteringSerializer;
+            private final Version version;
+
+            public Serializer(CFMetaData metadata, Version version, SerializationHeader header)
+            {
+                this.clusteringSerializer = metadata.serializers().indexEntryClusteringPrefixSerializer(version, header);
+                this.version = version;
+            }
+
+            public void serialize(IndexInfo info, DataOutputPlus out) throws IOException
+            {
+                assert version.storeRows() : "We read old index files but we should never write them";
+
+                clusteringSerializer.serialize(info.firstName, out);
+                clusteringSerializer.serialize(info.lastName, out);
+                out.writeVInt(info.width - WIDTH_BASE);
+
+                out.writeBoolean(info.endOpenMarker != null);
+                if (info.endOpenMarker != null)
+                    DeletionTime.serializer.serialize(info.endOpenMarker, out);
+            }
+
+            public IndexInfo deserialize(DataInputPlus in) throws IOException
+            {
+                ClusteringPrefix firstName = clusteringSerializer.deserialize(in);
+                ClusteringPrefix lastName = clusteringSerializer.deserialize(in);
+                long width;
+                DeletionTime endOpenMarker = null;
+                if (version.storeRows())
+                {
+                    width = in.readVInt() + WIDTH_BASE;
+                    if (in.readBoolean())
+                        endOpenMarker = DeletionTime.serializer.deserialize(in);
+                }
+                else
+                {
+                    in.readLong(); // skip offset
+                    width = in.readLong();
+                }
+                return new IndexInfo(firstName, lastName, width, endOpenMarker);
+            }
+
+            public long serializedSize(IndexInfo info)
+            {
+                assert version.storeRows() : "We read old index files but we should never write them";
+
+                long size = clusteringSerializer.serializedSize(info.firstName)
+                          + clusteringSerializer.serializedSize(info.lastName)
+                          + TypeSizes.sizeofVInt(info.width - WIDTH_BASE)
+                          + TypeSizes.sizeof(info.endOpenMarker != null);
+
+                if (info.endOpenMarker != null)
+                    size += DeletionTime.serializer.serializedSize(info.endOpenMarker);
+                return size;
+            }
         }
 
-        public int serializedSize(TypeSizes typeSizes)
+        public long unsharedHeapSize()
         {
-            int firstNameSize = firstName.remaining();
-            int lastNameSize = lastName.remaining();
-            return typeSizes.sizeof((short) firstNameSize) + firstNameSize +
-                   typeSizes.sizeof((short) lastNameSize) + lastNameSize +
-                   typeSizes.sizeof(offset) + typeSizes.sizeof(width);
-        }
-
-        public static IndexInfo deserialize(DataInput in) throws IOException
-        {
-            return new IndexInfo(ByteBufferUtil.readWithShortLength(in), ByteBufferUtil.readWithShortLength(in), in.readLong(), in.readLong());
-        }
-
-        public long memorySize()
-        {
-            return ObjectSizes.getFieldSize(// firstName
-                                            ObjectSizes.getReferenceSize() +
-                                            // lastName
-                                            ObjectSizes.getReferenceSize() +
-                                            TypeSizes.NATIVE.sizeof(offset) +
-                                            TypeSizes.NATIVE.sizeof(width))
-                   + ObjectSizes.getSize(firstName) + ObjectSizes.getSize(lastName);
+            return EMPTY_SIZE
+                 + firstName.unsharedHeapSize()
+                 + lastName.unsharedHeapSize()
+                 + (endOpenMarker == null ? 0 : endOpenMarker.unsharedHeapSize());
         }
     }
 }

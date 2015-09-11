@@ -25,6 +25,8 @@ import java.util.Collection;
 import java.util.Random;
 import java.util.UUID;
 
+import com.google.common.annotations.VisibleForTesting;
+
 
 /**
  * The goods are here: www.ietf.org/rfc/rfc4122.txt.
@@ -78,6 +80,24 @@ public class UUIDGen
     public static UUID getTimeUUID(long when)
     {
         return new UUID(createTime(fromUnixTimestamp(when)), clockSeqAndNode);
+    }
+
+    public static UUID getTimeUUIDFromMicros(long whenInMicros)
+    {
+        long whenInMillis = whenInMicros / 1000;
+        long nanos = (whenInMicros - (whenInMillis * 1000)) * 10;
+        return getTimeUUID(whenInMillis, nanos);
+    }
+
+    public static UUID getTimeUUID(long when, long nanos)
+    {
+        return new UUID(createTime(fromUnixTimestamp(when, nanos)), clockSeqAndNode);
+    }
+
+    @VisibleForTesting
+    public static UUID getTimeUUID(long when, long nanos, long clockSeqAndNode)
+    {
+        return new UUID(createTime(fromUnixTimestamp(when, nanos)), clockSeqAndNode);
     }
 
     /** creates a type 1 uuid from raw bytes. */
@@ -161,28 +181,12 @@ public class UUIDGen
      * @return
      */
     private static long fromUnixTimestamp(long timestamp) {
-        return (timestamp - START_EPOCH) * 10000;
+        return fromUnixTimestamp(timestamp, 0L);
     }
 
-    /**
-     * Converts a milliseconds-since-epoch timestamp into the 16 byte representation
-     * of a type 1 UUID (a time-based UUID).
-     *
-     * <p><i><b>Deprecated:</b> This method goes again the principle of a time
-     * UUID and should not be used. For queries based on timestamp, minTimeUUID() and
-     * maxTimeUUID() can be used but this method has questionable usefulness. This is
-     * only kept because CQL2 uses it (see TimeUUID.fromStringCQL2) and we
-     * don't want to break compatibility.</i></p>
-     *
-     * <p><i><b>Warning:</b> This method is not guaranteed to return unique UUIDs; Multiple
-     * invocations using identical timestamps will result in identical UUIDs.</i></p>
-     *
-     * @param timeMillis
-     * @return a type 1 UUID represented as a byte[]
-     */
-    public static byte[] getTimeUUIDBytes(long timeMillis)
+    private static long fromUnixTimestamp(long timestamp, long nanos)
     {
-        return createTimeUUIDBytes(instance.createTimeUnsafe(timeMillis));
+        return ((timestamp - START_EPOCH) * 10000) + nanos;
     }
 
     /**
@@ -254,12 +258,6 @@ public class UUIDGen
             nanosSince = ++lastNanos;
 
         return createTime(nanosSince);
-    }
-
-    /** @param when time in milliseconds */
-    private long createTimeUnsafe(long when)
-    {
-        return createTimeUnsafe(when, 0);
     }
 
     private long createTimeUnsafe(long when, int nanos)

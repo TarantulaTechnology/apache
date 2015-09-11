@@ -44,10 +44,6 @@ public class FollowerZooKeeperServer extends LearnerZooKeeperServer {
     private static final Logger LOG =
         LoggerFactory.getLogger(FollowerZooKeeperServer.class);
 
-    CommitProcessor commitProcessor;
-
-    SyncRequestProcessor syncProcessor;
-
     /*
      * Pending sync requests
      */
@@ -73,7 +69,7 @@ public class FollowerZooKeeperServer extends LearnerZooKeeperServer {
     protected void setupRequestProcessors() {
         RequestProcessor finalProcessor = new FinalRequestProcessor(this);
         commitProcessor = new CommitProcessor(finalProcessor,
-                Long.toString(getServerId()), true);
+                Long.toString(getServerId()), true, getZooKeeperServerListener());
         commitProcessor.start();
         firstProcessor = new FollowerRequestProcessor(this, commitProcessor);
         ((FollowerRequestProcessor) firstProcessor).start();
@@ -127,25 +123,8 @@ public class FollowerZooKeeperServer extends LearnerZooKeeperServer {
 
     @Override
     public int getGlobalOutstandingLimit() {
-        return super.getGlobalOutstandingLimit() / (self.getQuorumSize() - 1);
-    }
-
-    @Override
-    public void shutdown() {
-        LOG.info("Shutting down");
-        try {
-            super.shutdown();
-        } catch (Exception e) {
-            LOG.warn("Ignoring unexpected exception during shutdown", e);
-        }
-        try {
-            if (syncProcessor != null) {
-                syncProcessor.shutdown();
-            }
-        } catch (Exception e) {
-            LOG.warn("Ignoring unexpected exception in syncprocessor shutdown",
-                    e);
-        }
+        int divisor = self.getQuorumSize() > 2 ? self.getQuorumSize() - 1 : 1;
+        return super.getGlobalOutstandingLimit() / divisor;
     }
 
     @Override

@@ -25,6 +25,7 @@ import java.util.Collection;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -38,7 +39,9 @@ import org.apache.jute.Record;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.KeeperException.NoNodeException;
 import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.Watcher.WatcherType;
 import org.apache.zookeeper.ZooDefs;
+import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.data.ACL;
 import org.apache.zookeeper.data.Stat;
 import org.apache.zookeeper.server.DataTree.ProcessTxnResult;
@@ -306,6 +309,7 @@ public class ZKDatabase {
                     && (itr.getHeader().getZxid() > startZxid)) {
                 LOG.warn("Unable to find proposals from txnlog for zxid: "
                         + startZxid);
+                itr.close();
                 return TxnLogProposalIterator.EMPTY_ITERATOR;
             }
 
@@ -314,11 +318,19 @@ public class ZKDatabase {
                 if (txnSize > sizeLimit) {
                     LOG.info("Txnlog size: " + txnSize + " exceeds sizeLimit: "
                             + sizeLimit);
+                    itr.close();
                     return TxnLogProposalIterator.EMPTY_ITERATOR;
                 }
             }
         } catch (IOException e) {
             LOG.error("Unable to read txnlog from disk", e);
+            try {
+                if (itr != null) {
+                    itr.close();
+                }
+            } catch (IOException ioe) {
+                LOG.warn("Error closing file iterator", ioe);
+            }
             return TxnLogProposalIterator.EMPTY_ITERATOR;
         }
         return new TxnLogProposalIterator(itr);
@@ -347,6 +359,10 @@ public class ZKDatabase {
      */
     public void dumpEphemerals(PrintWriter pwriter) {
         dataTree.dumpEphemerals(pwriter);
+    }
+
+    public Map<Long, Set<String>> getEphemerals() {
+        return dataTree.getEphemerals();
     }
 
     /**
@@ -555,17 +571,17 @@ public class ZKDatabase {
         this.snapLog.close();
     }
 
-    public synchronized void initConfigInZKDatabase(QuorumVerifier qv) {   
-    	if (qv == null) return; // only happens during tests
+    public synchronized void initConfigInZKDatabase(QuorumVerifier qv) {
+        if (qv == null) return; // only happens during tests
         try {
-             if (this.dataTree.getNode(ZooDefs.CONFIG_NODE) == null) {
-            	 // should only happen during upgrade
-            	 LOG.warn("configuration znode missing (hould only happen during upgrade), creating the node");
-                 this.dataTree.addConfigNode();
-             }
-             this.dataTree.setData(ZooDefs.CONFIG_NODE, qv.toString().getBytes(), -1, qv.getVersion(), System.currentTimeMillis());           
+            if (this.dataTree.getNode(ZooDefs.CONFIG_NODE) == null) {
+                // should only happen during upgrade
+                LOG.warn("configuration znode missing (hould only happen during upgrade), creating the node");
+                this.dataTree.addConfigNode();
+            }
+            this.dataTree.setData(ZooDefs.CONFIG_NODE, qv.toString().getBytes(), -1, qv.getVersion(), Time.currentWallTime());
         } catch (NoNodeException e) {
-           System.out.println("configuration node missing - should not happen");         
+            System.out.println("configuration node missing - should not happen");
         }
     }
  
@@ -575,5 +591,33 @@ public class ZKDatabase {
      */
     public void setSnapshotSizeFactor(double snapshotSizeFactor) {
         this.snapshotSizeFactor = snapshotSizeFactor;
+    }
+
+    /**
+     * Check whether the given watcher exists in datatree
+     *
+     * @param path
+     *            node to check watcher existence
+     * @param type
+     *            type of watcher
+     * @param watcher
+     *            watcher function
+     */
+    public boolean containsWatcher(String path, WatcherType type, Watcher watcher) {
+        return dataTree.containsWatcher(path, type, watcher);
+    }
+
+    /**
+     * Remove watch from the datatree
+     * 
+     * @param path
+     *            node to remove watches from
+     * @param type
+     *            type of watcher to remove
+     * @param watcher
+     *            watcher function to remove
+     */
+    public boolean removeWatch(String path, WatcherType type, Watcher watcher) {
+        return dataTree.removeWatch(path, type, watcher);
     }
 }

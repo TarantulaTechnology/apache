@@ -24,6 +24,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.File;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.ArrayList;
 
@@ -40,6 +41,9 @@ import org.junit.Assert;
 import org.junit.Test;
 
 public class LearnerTest extends ZKTestCase {
+    private static final File testData = new File(
+        System.getProperty("test.data.dir", "build/test/data"));
+
     static class SimpleLearnerZooKeeperServer extends LearnerZooKeeperServer {
 
         Learner learner;
@@ -74,9 +78,80 @@ public class LearnerTest extends ZKTestCase {
         }
     }
 
+    static class TimeoutLearner extends Learner {
+        int passSocketConnectOnAttempt = 10;
+        int socketConnectAttempt = 0;
+        long timeMultiplier = 0;
+
+        public void setTimeMultiplier(long multiplier) {
+            timeMultiplier = multiplier;
+        }
+
+        public void setPassConnectAttempt(int num) {
+            passSocketConnectOnAttempt = num;
+        }
+
+        protected long nanoTime() {
+            return socketConnectAttempt * timeMultiplier;
+        }
+        
+        protected int getSockConnectAttempt() {
+            return socketConnectAttempt;
+        }
+
+        @Override
+        protected void sockConnect(Socket sock, InetSocketAddress addr, int timeout) 
+        throws IOException {
+            if (++socketConnectAttempt < passSocketConnectOnAttempt)    {
+                throw new IOException("Test injected Socket.connect() error.");
+            }
+        }
+    }
+
+    @Test(expected=IOException.class)
+    public void connectionRetryTimeoutTest() throws Exception {
+        Learner learner = new TimeoutLearner();
+        learner.self = new QuorumPeer();
+        learner.self.setTickTime(2000);
+        learner.self.setInitLimit(5);
+        learner.self.setSyncLimit(2);
+
+        // this addr won't even be used since we fake the Socket.connect
+        InetSocketAddress addr = new InetSocketAddress(1111);
+
+        // we expect this to throw an IOException since we're faking socket connect errors every time
+        learner.connectToLeader(addr);
+    }
+    @Test
+    public void connectionInitLimitTimeoutTest() throws Exception {
+        TimeoutLearner learner = new TimeoutLearner();
+        learner.self = new QuorumPeer();
+        learner.self.setTickTime(2000);
+        learner.self.setInitLimit(5);
+        learner.self.setSyncLimit(2);
+
+        // this addr won't even be used since we fake the Socket.connect
+        InetSocketAddress addr = new InetSocketAddress(1111);
+        
+        // pretend each connect attempt takes 4000 milliseconds
+        learner.setTimeMultiplier((long)4000 * 1000000);
+        
+        learner.setPassConnectAttempt(5);
+
+        // we expect this to throw an IOException since we're faking socket connect errors every time
+        try {
+            learner.connectToLeader(addr);
+            Assert.fail("should have thrown IOException!");
+        } catch (IOException e) {
+            //good, wanted to see that, let's make sure we ran out of time
+            Assert.assertTrue(learner.nanoTime() > 2000*5*1000000);
+            Assert.assertEquals(3, learner.getSockConnectAttempt());
+        }
+    }
+
     @Test
     public void syncTest() throws Exception {
-        File tmpFile = File.createTempFile("test", ".dir");
+        File tmpFile = File.createTempFile("test", ".dir", testData);
         tmpFile.delete();
         try {
             FileTxnSnapLog ftsl = new FileTxnSnapLog(tmpFile, tmpFile);

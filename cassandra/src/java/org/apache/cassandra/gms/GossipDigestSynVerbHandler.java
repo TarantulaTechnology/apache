@@ -68,7 +68,7 @@ public class GossipDigestSynVerbHandler implements IVerbHandler<GossipDigestSyn>
                 sb.append(gDigest);
                 sb.append(" ");
             }
-            logger.trace("Gossip syn digests are : " + sb.toString());
+            logger.trace("Gossip syn digests are : {}", sb);
         }
 
         doSort(gDigestList);
@@ -76,13 +76,12 @@ public class GossipDigestSynVerbHandler implements IVerbHandler<GossipDigestSyn>
         List<GossipDigest> deltaGossipDigestList = new ArrayList<GossipDigest>();
         Map<InetAddress, EndpointState> deltaEpStateMap = new HashMap<InetAddress, EndpointState>();
         Gossiper.instance.examineGossiper(gDigestList, deltaGossipDigestList, deltaEpStateMap);
-
+        logger.trace("sending {} digests and {} deltas", deltaGossipDigestList.size(), deltaEpStateMap.size());
         MessageOut<GossipDigestAck> gDigestAckMessage = new MessageOut<GossipDigestAck>(MessagingService.Verb.GOSSIP_DIGEST_ACK,
                                                                                         new GossipDigestAck(deltaGossipDigestList, deltaEpStateMap),
                                                                                         GossipDigestAck.serializer);
         if (logger.isTraceEnabled())
             logger.trace("Sending a GossipDigestAckMessage to {}", from);
-        Gossiper.instance.checkSeedContact(from);
         MessagingService.instance().sendOneWay(gDigestAckMessage, from);
     }
 

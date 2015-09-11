@@ -21,7 +21,6 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
-
 import org.apache.pig.PigException;
 import org.apache.pig.PigWarning;
 import org.apache.pig.backend.executionengine.ExecException;
@@ -63,20 +62,20 @@ public class POProject extends ExpressionOperator {
 
     //True if we are in the middle of streaming tuples
     //in a bag
-    boolean processingBagOfTuples = false;
+    private boolean processingBagOfTuples = false;
 
     //The bag iterator used while straeming tuple
-    transient Iterator<Tuple> bagIterator = null;
+    private transient Iterator<Tuple> bagIterator = null;
 
     //Represents the fact that this instance of POProject
     //is overloaded to stream tuples in the bag rather
     //than passing the entire bag. It is the responsibility
     //of the translator to set this.
-    boolean overloaded = false;
+    protected boolean overloaded = false;
 
 
-    private boolean isProjectToEnd = false;
-    private int startCol;
+    protected boolean isProjectToEnd = false;
+    protected int startCol;
 
     public POProject(OperatorKey k) {
         this(k,-1,0);
@@ -310,7 +309,7 @@ public class POProject extends ExpressionOperator {
         } else if (input.result==null) {
             Result retVal = new Result();
             retVal.result = null;
-            retVal.returnStatus = POStatus.STATUS_NULL;
+            retVal.returnStatus = POStatus.STATUS_OK;
             return retVal;
         } else {
             throw new ExecException("Cannot dereference a bag from " + input.result.getClass().getName(), 1129);

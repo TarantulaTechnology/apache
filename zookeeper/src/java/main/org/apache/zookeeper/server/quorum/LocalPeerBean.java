@@ -66,7 +66,7 @@ public class LocalPeerBean extends ServerBean implements LocalPeerMXBean {
     }
     
     public String getState() {
-        return peer.getState().toString();
+        return peer.getServerState();
     }
     
     public String getQuorumAddress() {
@@ -75,5 +75,33 @@ public class LocalPeerBean extends ServerBean implements LocalPeerMXBean {
     
     public int getElectionType() {
         return peer.getElectionType();
+    }
+
+    public String getElectionAddress() {
+        return peer.getElectionAddress().getHostString() + ":" +
+            peer.getElectionAddress().getPort();
+    }
+
+    public String getClientAddress() {
+        return peer.getClientAddress().getHostString() + ":" +
+            peer.getClientAddress().getPort();
+    }
+
+    public String getLearnerType(){
+        return peer.getLearnerType().toString();
+    }
+
+    public long getConfigVersion(){
+        return peer.getQuorumVerifier().getVersion();
+    }
+
+    @Override
+    public String getQuorumSystemInfo() {
+        return peer.getQuorumVerifier().toString();
+    }
+
+    @Override
+    public boolean isPartOfEnsemble() {
+        return peer.getView().containsKey(peer.getId());
     }
 }

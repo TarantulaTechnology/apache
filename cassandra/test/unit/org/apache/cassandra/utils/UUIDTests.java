@@ -21,20 +21,19 @@ package org.apache.cassandra.utils;
  */
 
 
-import org.apache.cassandra.db.marshal.TimeUUIDType;
-import org.junit.Test;
-
-import java.math.BigInteger;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.util.UUID;
+
+import org.junit.Test;
+
+import org.apache.cassandra.db.marshal.TimeUUIDType;
+import org.apache.cassandra.utils.UUIDGen;
 
 
 public class UUIDTests
 {
     @Test
-    public void verifyType1() throws UnknownHostException
+    public void verifyType1()
     {
 
         UUID uuid = UUIDGen.getTimeUUID();
@@ -42,7 +41,7 @@ public class UUIDTests
     }
 
     @Test
-    public void verifyOrdering1() throws UnknownHostException
+    public void verifyOrdering1()
     {
         UUID one = UUIDGen.getTimeUUID();
         UUID two = UUIDGen.getTimeUUID();
@@ -51,7 +50,7 @@ public class UUIDTests
 
 
     @Test
-    public void testDecomposeAndRaw() throws UnknownHostException
+    public void testDecomposeAndRaw()
     {
         UUID a = UUIDGen.getTimeUUID();
         byte[] decomposed = UUIDGen.decompose(a);
@@ -60,7 +59,7 @@ public class UUIDTests
     }
 
     @Test
-    public void testTimeUUIDType() throws UnknownHostException
+    public void testTimeUUIDType()
     {
         TimeUUIDType comp = TimeUUIDType.instance;
         ByteBuffer first = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes());
@@ -72,19 +71,13 @@ public class UUIDTests
     }
 
     @Test
-    public void testUUIDTimestamp() throws UnknownHostException
+    public void testUUIDTimestamp()
     {
-        InetAddress addr = InetAddress.getByName("127.0.0.1");
         long now = System.currentTimeMillis();
         UUID uuid = UUIDGen.getTimeUUID();
         long tstamp = UUIDGen.getAdjustedTimestamp(uuid);
 
         // I'll be damn is the uuid timestamp is more than 10ms after now
         assert now <= tstamp && now >= tstamp - 10 : "now = " + now + ", timestamp = " + tstamp;
-    }
-
-    private void assertNonZero(BigInteger i)
-    {
-        assert i.toString(2).indexOf("1") > -1;
     }
 }

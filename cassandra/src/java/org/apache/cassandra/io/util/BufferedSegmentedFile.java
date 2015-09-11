@@ -17,40 +17,29 @@
  */
 package org.apache.cassandra.io.util;
 
-import java.io.File;
-
-public class BufferedSegmentedFile extends PoolingSegmentedFile
+public class BufferedSegmentedFile extends SegmentedFile
 {
-    public BufferedSegmentedFile(String path, long length)
+    public BufferedSegmentedFile(ChannelProxy channel, int bufferSize, long length)
     {
-        super(path, length);
+        super(new Cleanup(channel), channel, bufferSize, length);
+    }
+
+    private BufferedSegmentedFile(BufferedSegmentedFile copy)
+    {
+        super(copy);
     }
 
     public static class Builder extends SegmentedFile.Builder
     {
-        /**
-         * Adds a position that would be a safe place for a segment boundary in the file. For a block/row based file
-         * format, safe boundaries are block/row edges.
-         * @param boundary The absolute position of the potential boundary in the file.
-         */
-        public void addPotentialBoundary(long boundary)
+        public SegmentedFile complete(ChannelProxy channel, int bufferSize, long overrideLength)
         {
-            // only one segment in a standard-io file
-        }
-
-        /**
-         * Called after all potential boundaries have been added to apply this Builder to a concrete file on disk.
-         * @param path The file on disk.
-         */
-        public SegmentedFile complete(String path)
-        {
-            long length = new File(path).length();
-            return new BufferedSegmentedFile(path, length);
+            long length = overrideLength > 0 ? overrideLength : channel.size();
+            return new BufferedSegmentedFile(channel, bufferSize, length);
         }
     }
 
-    protected RandomAccessReader createReader(String path)
+    public BufferedSegmentedFile sharedCopy()
     {
-        return RandomAccessReader.open(new File(path), this);
+        return new BufferedSegmentedFile(this);
     }
 }

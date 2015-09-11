@@ -17,10 +17,9 @@
  */
 package org.apache.cassandra.gms;
 
-import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Token;
-
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -36,11 +35,11 @@ public class TokenSerializer
 
     public static void serialize(IPartitioner partitioner, Collection<Token> tokens, DataOutput out) throws IOException
     {
-        for (Token<?> token : tokens)
+        for (Token token : tokens)
         {
-            byte[] bintoken = partitioner.getTokenFactory().toByteArray(token).array();
-            out.writeInt(bintoken.length);
-            out.write(bintoken);
+            ByteBuffer tokenBuffer = partitioner.getTokenFactory().toByteArray(token);
+            assert tokenBuffer.arrayOffset() == 0;
+            ByteBufferUtil.writeWithLength(tokenBuffer.array(), out);
         }
         out.writeInt(0);
     }
@@ -59,10 +58,5 @@ public class TokenSerializer
             tokens.add(partitioner.getTokenFactory().fromByteArray(ByteBuffer.wrap(bintoken)));
         }
         return tokens;
-    }
-
-    public static long serializedSize(Collection<Token> tokens, TypeSizes typeSizes)
-    {
-        throw new UnsupportedOperationException();
     }
 }

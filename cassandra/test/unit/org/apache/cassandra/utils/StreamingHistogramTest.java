@@ -17,13 +17,13 @@
  */
 package org.apache.cassandra.utils;
 
-import org.junit.Test;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.util.*;
+import org.junit.Test;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 
 import static org.junit.Assert.assertEquals;
 
@@ -97,11 +97,11 @@ public class StreamingHistogramTest
             hist.update(samples[i]);
         }
 
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        StreamingHistogram.serializer.serialize(hist, new DataOutputStream(out));
+        DataOutputBuffer out = new DataOutputBuffer();
+        StreamingHistogram.serializer.serialize(hist, out);
         byte[] bytes = out.toByteArray();
 
-        StreamingHistogram deserialized = StreamingHistogram.serializer.deserialize(new DataInputStream(new ByteArrayInputStream(bytes)));
+        StreamingHistogram deserialized = StreamingHistogram.serializer.deserialize(new DataInputBuffer(bytes));
 
         // deserialized histogram should have following values
         Map<Double, Long> expected1 = new LinkedHashMap<Double, Long>(5);

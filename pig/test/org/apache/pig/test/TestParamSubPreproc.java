@@ -28,14 +28,18 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileReader;
 import java.io.FileWriter;
+import java.io.FilenameFilter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.util.Properties;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.util.Shell;
+import org.apache.pig.ExecType;
+import org.apache.pig.impl.PigContext;
 import org.apache.pig.tools.parameters.ParameterSubstitutionPreprocessor;
 import org.apache.pig.tools.parameters.ParseException;
 import org.junit.Test;
@@ -1344,6 +1348,56 @@ public class TestParamSubPreproc {
         inExpected.close();
         inResult.close();
     }
+
+    @Test
+    public void testGruntWithParamSub() throws Exception{
+        log.info("Starting test testGruntWithParamSub()");
+        File inputFile = Util.createFile(new String[]{"daniel\t10","jenny\t20"});
+        File outputFile = File.createTempFile("tmp", "");
+        outputFile.delete();
+        PigContext pc = new PigContext(ExecType.LOCAL, new Properties());
+        String command = "%default agelimit `echo 15`\n"
+                + "rmf $outputFile;\n"
+                + "a = load '" + Util.generateURI(inputFile.toString(), pc)  + "' as ($param1:chararray, $param2:int);\n"
+                + "b = filter a by age > $agelimit;"
+                + "store b into '$outputFile';\n"
+                + "quit\n";
+        System.setProperty("jline.WindowsTerminal.directConsole", "false");
+        System.setIn(new ByteArrayInputStream(command.getBytes()));
+        org.apache.pig.PigRunner.run(new String[] {"-x", "local", "-p", "param1=name", "-p", "param2=age", "-p", "outputFile=" + Util.generateURI(outputFile.toString(), pc)}, null);
+        File[] partFiles = outputFile.listFiles(new FilenameFilter() {
+            public boolean accept(File dir, String name) { 
+            return name.startsWith("part");
+        }
+        });
+        String resultContent = Util.readFile(partFiles[0]);
+        assertEquals(resultContent, "jenny\t20\n");
+    }
+
+    @Test
+    public void testGruntMultilineDefine() throws Exception{
+        log.info("Starting test testGruntMultilineDefine()");
+        File inputFile = Util.createFile(new String[]{"daniel\t10","jenny\t20"});
+        File outputFile = File.createTempFile("tmp", "");
+        outputFile.delete();
+        PigContext pc = new PigContext(ExecType.LOCAL, new Properties());
+        String command = "DEFINE process(input_file) returns data {\n" +
+                "$data = load '$input_file' using PigStorage(',');};\n" +
+                "b = process('" + Util.generateURI(inputFile.toString(), pc)  + "');\n" +
+                "store b into '" + Util.generateURI(outputFile.toString(), pc) + "';" +
+                "quit\n";
+        System.setProperty("jline.WindowsTerminal.directConsole", "false");
+        System.setIn(new ByteArrayInputStream(command.getBytes()));
+        org.apache.pig.PigRunner.run(new String[] {"-x", "local"}, null);
+        File[] partFiles = outputFile.listFiles(new FilenameFilter() {
+            public boolean accept(File dir, String name) { 
+            return name.startsWith("part");
+        }
+        });
+        String resultContent = Util.readFile(partFiles[0]);
+        assertEquals(resultContent, "daniel\t10\njenny\t20\n");
+    }
+
     @SuppressWarnings("resource")
     private BufferedReader WithConditionalReplacement(String filename, String orig, String dest, boolean replace) throws IOException {
         BufferedReader pigOrigIStream = new BufferedReader(new FileReader(filename));

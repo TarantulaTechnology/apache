@@ -17,17 +17,18 @@
  */
 package org.apache.cassandra.cql3;
 
-import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
-import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.transport.messages.ResultMessage;
 
 public interface CQLStatement
 {
     /**
      * Returns the number of bound terms in this statement.
      */
-    public int getBoundsTerms();
+    public int getBoundTerms();
 
     /**
      * Perform any access verification necessary for the statement.
@@ -53,9 +54,16 @@ public interface CQLStatement
     public ResultMessage execute(QueryState state, QueryOptions options) throws RequestValidationException, RequestExecutionException;
 
     /**
-     * Variante of execute used for internal query against the system tables, and thus only query the local node.
+     * Variant of execute used for internal query against the system tables, and thus only query the local node.
      *
      * @param state the current query state
      */
-    public ResultMessage executeInternal(QueryState state) throws RequestValidationException, RequestExecutionException;
+    public ResultMessage executeInternal(QueryState state, QueryOptions options) throws RequestValidationException, RequestExecutionException;
+
+    /**
+     * Return an Iterable over all of the functions (both native and user-defined) used by any component
+     * of the statement
+     * @return functions all functions found (may contain duplicates)
+     */
+    public Iterable<Function> getFunctions();
 }

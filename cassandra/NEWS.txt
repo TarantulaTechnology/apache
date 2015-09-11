@@ -13,21 +13,579 @@ restore snapshots created with the previous major version using the
 'sstableloader' tool. You can upgrade the file format of your snapshots
 using the provided 'sstableupgrade' tool.
 
-2.1
+3.0
 ===
+
+New features
+------------
+   - Support for IN restrictions on any partition key component or clustering key
+     as well as support for EQ and IN multicolumn restrictions has been added to
+     UPDATE and DELETE statement.
+   - Support for single-column and multi-colum slice restrictions (>, >=, <= and <)
+     has been added to DELETE statements
+   - nodetool rebuild_index accepts the index argument without
+     the redundant table name
+   - Materialized Views, which allow for server-side denormalization, is now
+     available. Materialized views provide an alternative to secondary indexes
+     for non-primary key queries, and perform much better for indexing high
+     cardinality columns.
+     See http://www.datastax.com/dev/blog/new-in-cassandra-3-0-materialized-views
+   - Hinted handoff has been completely rewritten. Hints are now stored in flat
+     files, with less overhead for storage and more efficient dispatch.
+     See CASSANDRA-6230 for full details.
+   - Option to not purge unrepaired tombstones. To avoid users having data resurrected
+     if repair has not been run within gc_grace_seconds, an option has been added to
+     only allow tombstones from repaired sstables to be purged. To enable, set the
+     compaction option 'only_purge_repaired_tombstones':true but keep in mind that if
+     you do not run repair for a long time, you will keep all tombstones around which
+     can cause other problems.
+
 Upgrading
 ---------
-   - Rolling upgrades from anything pre-2.0 is not supported.
-   - 2.0 must be atleast started before upgrading to 2.1 due to
-     the fact that the old JSON leveled manifest is migrated into
-     the sstable metadata files on startup in 2.0 and this code is
-     gone from 2.1.
+   - The native protocol versions 1 and 2 are not supported anymore.
+   - Max mutation size is now configurable via max_mutation_size_in_kb setting in
+     cassandra.yaml; the default is half the size commitlog_segment_size_in_mb * 1024.
+   - 3.0 requires Java 8u40 or later.
+   - The default JVM GC has been changed to G1GC.
+   - The default JVM flag -XX:+PerfDisableSharedMem will cause the following tools JVM
+     to stop working: jps, jstack, jinfo, jmc, jcmd as well as 3rd party tools like Jolokia.
+     If you wish to use these tools you can comment this flag out in cassandra-env.{sh,ps1}
+   - New transaction log files have been introduced to replace the compactions_in_progress
+     system table, temporary file markers (tmp and tmplink) and sstable ancerstors.
+     Therefore, compaction metadata no longer contains ancestors. Transaction log files
+     list sstable descriptors involved in compactions and other operations such as flushing
+     and streaming. Use the sstableutil tool to list any sstable files currently involved
+     in operations not yet completed, which previously would have been marked as temporary.
+     A transaction log file contains one sstable per line, with the prefix "add:" or "remove:".
+     They also contain a special line "commit", only inserted at the end when the transaction
+     is committed. On startup we use these files to cleanup any partial transactions that were
+     in progress when the process exited. If the commit line is found, we keep new sstables
+     (those with the "add" prefix) and delete the old sstables (those with the "remove" prefix),
+     vice-versa if the commit line is missing. Should you lose or delete these log files,
+     both old and new sstable files will be kept as live files, which will result in duplicated
+     sstables. These files are protected by incremental checksums so you should not manually
+     edit them. When restoring a full backup or moving sstable files, you should clean-up
+     any left over transactions and their temporary files first. You can use this command:
+      ===> sstableutil -c ks table
+     See CASSANDRA-7066 for full details.
+   - New write stages have been added for batchlog and materialized view mutations
+     you can set their size in cassandra.yaml
+   - User defined functions are now executed in a sandbox.
+     To use UDFs and UDAs, you have to enable them in cassandra.yaml.
+   - New SSTable version 'la' with improved bloom-filter false-positive handling
+     compared to previous version 'ka' used in 2.2 and 2.1. Running sstableupgrade
+     is not necessary but recommended.
+   - Before upgrading to 3.0, make sure that your cluster is in complete agreement
+     (schema versions outputted by `nodetool describecluster` are all the same).
+   - Schema metadata is now stored in the new `system_schema` keyspace, and
+     legacy `system.schema_*` tables are now gone; see CASSANDRA-6717 for details.
+   - Pig's CassandraStorage has been removed. Use CqlNativeStorage instead.
+   - Hadoop BulkOutputFormat and BulkRecordWriter have been removed; use
+     CqlBulkOutputFormat and CqlBulkRecordWriter instead.
+   - Hadoop ColumnFamilyInputFormat and ColumnFamilyOutputFormat have been removed;
+     use CqlInputFormat and CqlOutputFormat instead.
+   - Hadoop ColumnFamilyRecordReader and ColumnFamilyRecordWriter have been removed;
+     use CqlRecordReader and CqlRecordWriter instead.
+   - hinted_handoff_enabled in cassandra.yaml no longer supports a list of data centers.
+     To specify a list of excluded data centers when hinted_handoff_enabled is set to true,
+     use hinted_handoff_disabled_datacenters, see CASSANDRA-9035 for details.
+   - The `sstable_compression` and `chunk_length_kb` compression options have been deprecated.
+     The new options are `class` and `chunk_length_in_kb`. Disabling compression should now
+     be done by setting the new option `enabled` to `false`.
+   - Only map syntax is now allowed for caching options. ALL/NONE/KEYS_ONLY/ROWS_ONLY syntax
+     has been deprecated since 2.1.0 and is being removed in 3.0.0.
+   - The 'index_interval' option for 'CREATE TABLE' statements, which has been deprecated
+     since 2.1 and replaced with the 'min_index_interval' and 'max_index_interval' options,
+     has now been removed.
+   - Batchlog entries are now stored in a new table - system.batches.
+     The old one has been deprecated.
+   - JMX methods set/getCompactionStrategyClass have been removed, use
+     set/getCompactionParameters or set/getCompactionParametersJson instead.
+   - SizeTieredCompactionStrategy parameter cold_reads_to_omit has been removed.
+   - The secondary index API has been comprehensively reworked. This will be a breaking
+     change for any custom index implementations, which should now look to implement
+     the new org.apache.cassandra.index.Index interface.
+
+
+2.2.2
+=====
+
+Changed Defaults
+----------------
+   - commitlog_total_space_in_mb will use the smaller of 8192, and 1/4
+     of the total space of the commitlog volume. (Before: always used
+     8192)
+
+
+2.2.1
+=====
+
+New features
+------------
+   - COUNT(*) and COUNT(1) can be selected with other columns or functions
+
+
+2.2
+===
+
+New features
+------------
+   - Very large batches will now be rejected (defaults to 50kb). This
+     can be customized by modifying batch_size_fail_threshold_in_kb.
+   - Selecting columns,scalar functions, UDT fields, writetime or ttl together
+     with aggregated is now possible. The value returned for the columns,
+     scalar functions, UDT fields, writetime and ttl will be the ones for
+     the first row matching the query.
+   - Windows is now a supported platform. Powershell execution for startup scripts
+     is highly recommended and can be enabled via an administrator command-prompt
+     with: 'powershell set-executionpolicy unrestricted'
+   - It is now possible to do major compactions when using leveled compaction.
+     Doing that will take all sstables and compact them out in levels. The
+     levels will be non overlapping so doing this will still not be something
+     you want to do very often since it might cause more compactions for a while.
+     It is also possible to split output when doing a major compaction with
+     STCS - files will be split in sizes 50%, 25%, 12.5% etc of the total size.
+     This might be a bit better than old major compactions which created one big
+     file on disk.
+   - A new tool has been added bin/sstableverify that checks for errors/bitrot
+     in all sstables.  Unlike scrub, this is a non-invasive tool.
+   - Authentication & Authorization APIs have been updated to introduce
+     roles. Roles and Permissions granted to them are inherited, supporting
+     role based access control. The role concept supercedes that of users
+     and CQL constructs such as CREATE USER are deprecated but retained for
+     compatibility. The requirement to explicitly create Roles in Cassandra
+     even when auth is handled by an external system has been removed, so
+     authentication & authorization can be delegated to such systems in their
+     entirety.
+   - In addition to the above, Roles are also first class resources and can be the
+     subject of permissions. Users (roles) can now be granted permissions on other
+     roles, including CREATE, ALTER, DROP & AUTHORIZE, which removesthe need for
+     superuser privileges in order to perform user/role management operations.
+   - Creators of database resources (Keyspaces, Tables, Roles) are now automatically
+     granted all permissions on them (if the IAuthorizer implementation supports
+     this).
+   - SSTable file name is changed. Now you don't have Keyspace/CF name
+     in file name. Also, secondary index has its own directory under parent's
+     directory.
+   - Support for user-defined functions and user-defined aggregates have
+     been added to CQL.
+     ************************************************************************
+     IMPORTANT NOTE: user-defined functions can be used to execute
+     arbitrary and possibly evil code in Cassandra 2.2, and are
+     therefore disabled by default.  To enable UDFs edit
+     cassandra.yaml and set enable_user_defined_functions to true.
+
+     CASSANDRA-9402 will add a security manager for UDFs in Cassandra
+     3.0.  This will inherently be backwards-incompatible with any 2.2
+     UDF that perform insecure operations such as opening a socket or
+     writing to the filesystem.
+     ************************************************************************
+   - Row-cache is now fully off-heap.
+   - jemalloc is now automatically preloaded and used on Linux and OS-X if
+     installed.
+   - Please ensure on Unix platforms that there is no libjnadispath.so
+     installed which is accessible by Cassandra. Old versions of
+     libjna packages (< 4.0.0) will cause problems - e.g. Debian Wheezy
+     contains libjna versin 3.2.x.
+   - The node now keeps up when streaming is failed during bootstrapping. You can
+     use new `nodetool bootstrap resume` command to continue streaming after resolving
+     an issue.
+   - Protocol version 4 specifies that bind variables do not require having a
+     value when executing a statement. Bind variables without a value are
+     called 'unset'. The 'unset' bind variable is serialized as the int
+     value '-2' without following bytes.
+     In an EXECUTE or BATCH request an unset bind value does not modify the value and
+     does not create a tombstone, an unset bind ttl is treated as 'unlimited',
+     an unset bind timestamp is treated as 'now', an unset bind counter operation
+     does not change the counter value.
+     Unset tuple field, UDT field and map key are not allowed.
+     In a QUERY request an unset limit is treated as 'unlimited'.
+     Unset WHERE clauses with unset partition column, clustering column
+     or index column are not allowed.
+   - New `ByteType` (cql tinyint). 1-byte signed integer
+   - New `ShortType` (cql smallint). 2-byte signed integer
+   - New `SimpleDateType` (cql date). 4-byte unsigned integer
+   - New `TimeType` (cql time). 8-byte long
+   - The toDate(timeuuid), toTimestamp(timeuuid) and toUnixTimestamp(timeuuid) functions have been added to allow
+     to convert from timeuuid into date type, timestamp type and bigint raw value.
+     The functions unixTimestampOf(timeuuid) and dateOf(timeuuid) have been deprecated.
+   - The toDate(timestamp) and toUnixTimestamp(timestamp) functions have been added to allow
+     to convert from timestamp into date type and bigint raw value.
+   - The toTimestamp(date) and toUnixTimestamp(date) functions have been added to allow
+     to convert from date into timestamp type and bigint raw value.
+   - SizeTieredCompactionStrategy parameter cold_reads_to_omit has been removed.
+
+
+2.1.9
+=====
+
+Upgrading
+---------
+    - cqlsh will now display timestamps with a UTC timezone. Previously,
+      timestamps were displayed with the local timezone.
+    - Commit log files are no longer recycled by default, due to negative
+      performance implications. This can be enabled again with the 
+      commitlog_segment_recycling option in your cassandra.yaml 
+    - JMX methods set/getCompactionStrategyClass have been deprecated, use
+      set/getCompactionParameters/set/getCompactionParametersJson instead
+
+
+2.1.8
+=====
+
+Upgrading
+---------
+    - Nothing specific to this release, but please see 2.1 if you are upgrading
+      from a previous version.
+
+
+2.1.7
+=====
+
+Upgrading
+---------
+   - Thrift rpc is no longer being started by default.
+     Set `start_rpc` parameter to `true` to enable it.
+   - Pig's CqlStorage has been removed, use CqlNativeStorage instead
+   - Pig's CassandraStorage has been deprecated. CassandraStorage
+     should only be used against tables created via thrift.
+     Use CqlNativeStorage for all other tables.
+   - IAuthenticator been updated to remove responsibility for user/role
+     maintenance and is now solely responsible for validating credentials,
+     This is primarily done via SASL, though an optional method exists for
+     systems which need support for the Thrift login() method.
+   - IRoleManager interface has been added which takes over the maintenance
+     functions from IAuthenticator. IAuthorizer is mainly unchanged. Auth data
+     in systems using the stock internal implementations PasswordAuthenticator
+     & CassandraAuthorizer will be automatically converted during upgrade,
+     with minimal operator intervention required. Custom implementations will
+     require modification, though these can be used in conjunction with the
+     stock CassandraRoleManager so providing an IRoleManager implementation
+     should not usually be necessary.
+   - Fat client support has been removed since we have push notifications to clients
+   - cassandra-cli has been removed. Please use cqlsh instead.
+   - YamlFileNetworkTopologySnitch has been removed; switch to
+     GossipingPropertyFileSnitch instead.
+   - CQL2 has been removed entirely in this release (previously deprecated
+     in 2.0.0). Please switch to CQL3 if you haven't already done so.
+   - The results of CQL3 queries containing an IN restriction will be ordered
+     in the normal order and not anymore in the order in which the column values were
+     specified in the IN restriction.
+   - Some secondary index queries with restrictions on non-indexed clustering
+     columns were not requiring ALLOW FILTERING as they should. This has been
+     fixed, and those queries now require ALLOW FILTERING (see CASSANDRA-8418
+     for details).
+   - The SSTableSimpleWriter and SSTableSimpleUnsortedWriter classes have been
+     deprecated and will be removed in the next major Cassandra release. You
+     should use the CQLSSTableWriter class instead.
+   - The sstable2json and json2sstable tools have been deprecated and will be
+     removed in the next major Cassandra release. See CASSANDRA-9618
+     (https://issues.apache.org/jira/browse/CASSANDRA-9618) for details.
+   - nodetool enablehandoff will no longer support a list of data centers starting
+     with the next major release. Two new commands will be added, enablehintsfordc and disablehintsfordc,
+     to exclude data centers from using hinted handoff when the global status is enabled.
+     In cassandra.yaml, hinted_handoff_enabled will no longer support a list of data centers starting
+     with the next major release. A new setting will be added, hinted_handoff_disabled_datacenters,
+     to exclude data centers when the global status is enabled, see CASSANDRA-9035 for details.
+
+
+2.1.6
+=====
+
+Upgrading
+---------
+    - Nothing specific to this release, but please see 2.1 if you are upgrading
+      from a previous version.
+
+
+2.1.5
+=====
+
+Upgrading
+---------
+    - The option to omit cold sstables with size tiered compaction has been
+      removed - it is almost always better to use date tiered compaction for
+      workloads that have cold data.
+
+2.1.4
+=====
+
+Upgrading
+---------
+The default JMX config now listens to localhost only. You must enable
+the other JMX flags in cassandra-env.sh manually.
+
+
+2.1.3
+=====
+
+Upgrading
+---------
+    - Prepending a list to a list collection was erroneously resulting in
+      the prepended list being reversed upon insertion.  If you were depending
+      on this buggy behavior, note that it has been corrected.
+    - Incremental replacement of compacted SSTables has been disabled for this
+      release.
+
+
+2.1.2
+=====
+
+Upgrading
+---------
+    - Nothing specific to this release, but please see 2.1 if you are upgrading
+      from a previous version.
+
+
+2.1.1
+=====
+
+Upgrading
+---------
+    - Nothing specific to this release, but please see 2.1 if you are upgrading
+      from a previous version.
+
+New features
+------------
+   - Netty support for epoll on linux is now enabled.  If for some
+     reason you want to disable it pass, the following system property
+     -Dcassandra.native.epoll.enabled=false
+
+
+2.1
+===
+
+New features
+------------
+   - Default data and log locations have changed.  If not set in
+     cassandra.yaml, the data file directory, commitlog directory,
+     and saved caches directory will default to $CASSANDRA_HOME/data/data,
+     $CASSANDRA_HOME/data/commitlog, and $CASSANDRA_HOME/data/saved_caches,
+     respectively.  The log directory now defaults to $CASSANDRA_HOME/logs.
+     If not set, $CASSANDRA_HOME, defaults to the top-level directory of
+     the installation.
+     Note that this should only affect source checkouts and tarballs.
+     Deb and RPM packages will continue to use /var/lib/cassandra and
+     /var/log/cassandra in cassandra.yaml.
+   - SSTable data directory name is slightly changed. Each directory will
+     have hex string appended after CF name, e.g.
+         ks/cf-5be396077b811e3a3ab9dc4b9ac088d/
+     This hex string part represents unique ColumnFamily ID.
+     Note that existing directories are used as is, so only newly created
+     directories after upgrade have new directory name format.
+   - Saved key cache files also have ColumnFamily ID in their file name.
+   - It is now possible to do incremental repairs, sstables that have been
+     repaired are marked with a timestamp and not included in the next
+     repair session. Use nodetool repair -par -inc to use this feature.
+     A tool to manually mark/unmark sstables as repaired is available in
+     tools/bin/sstablerepairedset. This is particularly important when
+     using LCS, or any data not repaired in your first incremental repair
+     will be put back in L0.
+   - Bootstrapping now ensures that range movements are consistent,
+     meaning the data for the new node is taken from the node that is no
+     longer a responsible for that range of keys.
+     If you want the old behavior (due to a lost node perhaps)
+     you can set the following property (-Dcassandra.consistent.rangemovement=false)
+   - It is now possible to use quoted identifiers in triggers' names.
+     WARNING: if you previously used triggers with capital letters in their
+     names, then you must quote them from now on.
+   - Improved stress tool (http://goo.gl/OTNqiQ)
+   - New incremental repair option (http://goo.gl/MjohJp, http://goo.gl/f8jSme)
+   - Incremental replacement of compacted SSTables (http://goo.gl/JfDBGW)
+   - The row cache can now cache only the head of partitions (http://goo.gl/6TJPH6)
+   - Off-heap memtables (http://goo.gl/YT7znJ)
+   - CQL improvements and additions: User-defined types, tuple types, 2ndary
+     indexing of collections, ... (http://goo.gl/kQl7GW)
+
+Upgrading
+---------
+   - commitlog_sync_batch_window_in_ms behavior has changed from the
+     maximum time to wait between fsync to the minimum time.  We are 
+     working on making this more user-friendly (see CASSANDRA-9533) but in the
+     meantime, this means 2.1 needs a much smaller batch window to keep
+     writer threads from starving.  The suggested default is now 2ms.
+   - Rolling upgrades from anything pre-2.0.7 is not supported. Furthermore
+     pre-2.0 sstables are not supported. This means that before upgrading
+     a node on 2.1, this node must be started on 2.0 and
+     'nodetool upgdradesstables' must be run (and this even in the case
+     of not-rolling upgrades).
+   - For size-tiered compaction users, Cassandra now defaults to ignoring
+     the coldest 5% of sstables.  This can be customized with the
+     cold_reads_to_omit compaction option; 0.0 omits nothing (the old
+     behavior) and 1.0 omits everything.
+   - Multithreaded compaction has been removed.
+   - Counters implementation has been changed, replaced by a safer one with
+     less caveats, but different performance characteristics. You might have
+     to change your data model to accomodate the new implementation.
+     (See https://issues.apache.org/jira/browse/CASSANDRA-6504 and the
+     blog post at http://goo.gl/qj8iQl for details).
+   - (per-table) index_interval parameter has been replaced with
+     min_index_interval and max_index_interval paratemeters. index_interval
+     has been deprecated.
+   - support for supercolumns has been removed from json2sstable
+
+
+2.0.11
+======
+
+Upgrading
+---------
+    - Nothing specific to this release, but refer to previous entries if you
+      are upgrading from a previous version.
+
+New features
+------------
+    - DateTieredCompactionStrategy added, optimized for time series data and groups
+      data that is written closely in time (CASSANDRA-6602 for details). Consider
+      this experimental for now.
+
+
+2.0.10
+======
+
+New features
+------------
+    - CqlPaginRecordReader and CqlPagingInputFormat have both been removed.
+      Use CqlInputFormat instead.
+    - If you are using Leveled Compaction, you can now disable doing size-tiered
+      compaction in L0 by starting Cassandra with -Dcassandra.disable_stcs_in_l0
+      (see CASSANDRA-6621 for details).
+    - Shuffle and taketoken have been removed.  For clusters that choose to
+      upgrade to vnodes, creating a new datacenter with vnodes and migrating is
+      recommended. See http://goo.gl/Sna2S1 for further information.
+
+
+2.0.9
+=====
+
+Upgrading
+---------
+    - Default values for read_repair_chance and local_read_repair_chance have been
+      swapped. Namely, default read_repair_chance is now set to 0.0, and default
+      local_read_repair_chance to 0.1.
+    - Queries selecting only CQL static columns were (mistakenly) not returning one
+      result per row in the partition. This has been fixed and a SELECT DISTINCT
+      can be used when only the static column of a partition needs to be fetch
+      without fetching the whole partition. But if you use static columns, please
+      make sure this won't affect you (see CASSANDRA-7305 for details).
+
+
+2.0.8
+=====
+
+New features
+------------
+    - New snitches have been used for users of Google Compute Engine and of
+      Cloudstack.
+
+Upgrading
+---------
+    - Nothing specific to this release, but please see 2.0.7 if you are upgrading
+      from a previous version.
+
+
+2.0.7
+=====
+
+Upgrading
+---------
+    - Nothing specific to this release, but please see 2.0.6 if you are upgrading
+      from a previous version.
+
+
+2.0.6
+=====
+
+New features
+------------
+    - CQL now support static columns, allows to batch multiple conditional updates
+      and has a new syntax for slicing over multiple clustering columns
+      (http://goo.gl/B6qz4j).
+    - Repair can be restricted to a set of nodes using the -hosts option in nodetool.
+    - A new 'nodetool taketoken' command relocate tokens with vnodes.
+    - Hinted handoff can be enabled only for some data-centers (see
+      hinted_handoff_enabled in cassandra.yaml)
+
+Upgrading
+---------
+    - Nothing specific to this release, but please see 2.0.5 if you are upgrading
+      from a previous version.
+
+
+2.0.5
+=====
+
+New features
+------------
+    - Batchlog replay can be, and is throttled by default now.
+      See batchlog_replay_throttle_in_kb setting in cassandra.yaml.
+    - Scrub can now optionally skip corrupt counter partitions. Please note
+      that this will lead to the loss of all the counter updates in the skipped
+      partition. See the --skip-corrupted option.
+
+Upgrading
+---------
+    - If your cluster began on a version before 1.2, check that your secondary
+      index SSTables are on version 'ic' before upgrading.  If not, run
+      'nodetool upgradesstables' if on 1.2.14 or later, or run 'nodetool
+      upgradesstables ks cf' with the keyspace and secondary index named
+      explicitly otherwise.  If you don't do this and upgrade to 2.0.x and it
+      refuses to start because of 'hf' version files in the secondary index,
+      you will need to delete/move them out of the way and recreate the index
+      when 2.0.x starts.
+
+
+2.0.3
+=====
+
+New features
+------------
+    - It's now possible to configure the maximum allowed size of the native
+      protocol frames (native_transport_max_frame_size_in_mb in the yaml file).
+
+Upgrading
+---------
+    - NaN and Infinity are new valid floating point constants in CQL3 and are now reserved
+      keywords. In the unlikely case you were using one of them as an identifier (for a
+      column, a keyspace or a table), you will now have to double-quote them (see
+      http://cassandra.apache.org/doc/cql3/CQL.html#identifiers for "quoted identifiers").
+    - The IEndpointStateChangeSubscriber has a new method, beforeChange, that
+      any custom implemenations using the class will need to implement.
+
+
+2.0.2
+=====
+
+New features
+------------
+    - Speculative retry defaults to 99th percentile
+      (See blog post at http://www.datastax.com/dev/blog/rapid-read-protection-in-cassandra-2-0-2)
+    - Configurable metrics reporting
+      (see conf/metrics-reporter-config-sample.yaml)
+    - Compaction history and stats are now saved to system keyspace
+      (system.compaction_history table). You can access historiy via
+      new 'nodetool compactionhistory' command or CQL.
+
+Upgrading
+---------
+    - Nodetool defaults to Sequential mode for repair operations
+
+
+2.0.1
+=====
+Upgrading
+---------
+    - The default memtable allocation has changed from 1/3 of heap to 1/4
+      of heap.  Also, default (single-partition) read and write timeouts
+      have been reduced from 10s to 5s and 2s, respectively.
+
 
 2.0.0
 =====
 
 Upgrading
 ---------
+    - Java 7 is now *required*!
     - Upgrading is ONLY supported from Cassandra 1.2.9 or later. This
       goes for sstable compatibility as well as network.  When
       upgrading from an earlier release, upgrade to 1.2.9 first and
@@ -69,7 +627,7 @@ Operations
     - VNodes are enabled by default in cassandra.yaml.  initial_token
       for non-vnode deployments has been removed from the example
       yaml, but is still respected if specified.
-    - Major compactions, cleanup, scrub, and upgradesstables will interrupt 
+    - Major compactions, cleanup, scrub, and upgradesstables will interrupt
       any in-progress compactions (but not repair validations) when invoked.
     - Disabling autocompactions by setting min/max compaction threshold to 0
       has been deprecated, instead, use the nodetool commands 'disableautocompaction'
@@ -86,7 +644,7 @@ Operations
       use DESCRIBE FULL SCHEMA if you need the schema of system_* keyspaces.
     - CQL2 has been deprecated, and will be removed entirely in 2.2. See
       CASSANDRA-5918 for details.
-    - Commit log archiver now assumes the client time stamp to be in microsecond 
+    - Commit log archiver now assumes the client time stamp to be in microsecond
       precision, during restore. Please refer to commitlog_archiving.properties.
 
 
@@ -104,6 +662,16 @@ Features
     - Numerous improvements to CQL3 and a new version of the native protocol. See
       http://www.datastax.com/dev/blog/cql-in-cassandra-2-0 for details.
 
+1.2.11
+======
+
+Features
+--------
+    - Added a new consistency level, LOCAL_ONE, that forces all CL.ONE operations to
+      execute only in the local datacenter.
+    - New replace_address to supplant the (now removed) replace_token and
+      replace_node workflows to replace a dead node in place.  Works like the
+      old options, but takes the IP address of the node to be replaced.
 
 1.2.9
 =====
@@ -168,9 +736,9 @@ Upgrading
 
 Upgrading
 ---------
-    - 'nodetool upgradesstables' now only upgrade/rewrite sstables that are not
-      on the current version (which is usually what you want). Use the new -a
-      flag to recover the old behavior of rewriting all sstables.
+    - 'nodetool upgradesstables' now only upgrades/rewrites sstables that are
+      not on the current version (which is usually what you want). Use the new
+      -a flag to recover the old behavior of rewriting all sstables.
 
 Features
 --------

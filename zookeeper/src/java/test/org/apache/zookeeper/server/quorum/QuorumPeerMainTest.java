@@ -28,7 +28,6 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.regex.Pattern;
 
 import org.apache.log4j.Layout;
@@ -42,6 +41,7 @@ import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.ZooKeeper.States;
+import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.server.quorum.Leader.Proposal;
 import org.apache.zookeeper.test.ClientBase;
 import org.junit.Assert;
@@ -79,10 +79,19 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
         Assert.assertTrue("waiting for server 2 being up",
                         ClientBase.waitForServerUp("127.0.0.1:" + CLIENT_PORT_QP2,
                         CONNECTION_TIMEOUT));
+        QuorumPeer quorumPeer = q1.main.quorumPeer;
+
+        int tickTime = quorumPeer.getTickTime();
+        Assert.assertEquals(
+                "Default value of minimumSessionTimeOut is not considered",
+                tickTime * 2, quorumPeer.getMinSessionTimeout());
+        Assert.assertEquals(
+                "Default value of maximumSessionTimeOut is not considered",
+                tickTime * 20, quorumPeer.getMaxSessionTimeout());
 
         ZooKeeper zk = new ZooKeeper("127.0.0.1:" + CLIENT_PORT_QP1,
                 ClientBase.CONNECTION_TIMEOUT, this);
-
+        waitForOne(zk, States.CONNECTED);
         zk.create("/foo_q1", "foobar1".getBytes(), Ids.OPEN_ACL_UNSAFE,
                 CreateMode.PERSISTENT);
         Assert.assertEquals(new String(zk.getData("/foo_q1", null, null)), "foobar1");
@@ -90,7 +99,7 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
 
         zk = new ZooKeeper("127.0.0.1:" + CLIENT_PORT_QP2,
                 ClientBase.CONNECTION_TIMEOUT, this);
-
+        waitForOne(zk, States.CONNECTED);
         zk.create("/foo_q2", "foobar2".getBytes(), Ids.OPEN_ACL_UNSAFE,
                 CreateMode.PERSISTENT);
         Assert.assertEquals(new String(zk.getData("/foo_q2", null, null)), "foobar2");
@@ -113,7 +122,6 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
     @Test
     public void testEarlyLeaderAbandonment() throws Exception {
         ClientBase.setupTestEnv();
-
         final int SERVER_COUNT = 3;
         final int clientPorts[] = new int[SERVER_COUNT];
         StringBuilder sb = new StringBuilder();
@@ -143,10 +151,12 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
 
         for (int i = 0; i < SERVER_COUNT; i++) {
             mt[i].start();
-        }
+            // Recreate a client session since the previous session was not persisted.
+            zk[i] = new ZooKeeper("127.0.0.1:" + clientPorts[i], ClientBase.CONNECTION_TIMEOUT, this);
+         }
 
-        waitForAll(zk, States.CONNECTED);          
-                          
+        waitForAll(zk, States.CONNECTED);
+
 
         // ok lets find the leader and kill everything else, we have a few
         // seconds, so it should be plenty of time
@@ -182,6 +192,8 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
         }
         for (int i = 0; i < SERVER_COUNT; i++) {
             if (i != leader) {
+                // Recreate a client session since the previous session was not persisted.
+                zk[i] = new ZooKeeper("127.0.0.1:" + clientPorts[i], ClientBase.CONNECTION_TIMEOUT, this);
                 waitForOne(zk[i], States.CONNECTED);
                 zk[i].create("/zk" + i, "zk".getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
             }
@@ -306,24 +318,29 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
     }
 
     private void waitForOne(ZooKeeper zk, States state) throws InterruptedException {
+        int iterations = ClientBase.CONNECTION_TIMEOUT / 500;
         while (zk.getState() != state) {
+            if (iterations-- == 0) {
+                throw new RuntimeException("Waiting too long");
+            }
             Thread.sleep(500);
         }
     }
 
     private void waitForAll(ZooKeeper[] zks, States state) throws InterruptedException {
-        int iterations = 10;
+        int iterations = ClientBase.CONNECTION_TIMEOUT / 1000;
         boolean someoneNotConnected = true;
-        while (someoneNotConnected) {           
+        while (someoneNotConnected) {
             if (iterations-- == 0) {
                 ClientBase.logAllStackTraces();
                 throw new RuntimeException("Waiting too long");
             }
 
             someoneNotConnected = false;
-            for (ZooKeeper zk : zks) {                
+            for (ZooKeeper zk : zks) {
                 if (zk.getState() != state) {
                     someoneNotConnected = true;
+                    break;
                 }
             }
             Thread.sleep(1000);
@@ -401,7 +418,7 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
 
             boolean isup =
                     ClientBase.waitForServerUp("127.0.0.1:" + CLIENT_PORT_QP1,
-                    5000);
+                    30000);
 
             Assert.assertFalse("Server never came up", isup);
 
@@ -562,7 +579,7 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
 
         ZooKeeper zk = new ZooKeeper("127.0.0.1:" + CLIENT_PORT_QP1,
                 ClientBase.CONNECTION_TIMEOUT, this);
-
+        waitForOne(zk, States.CONNECTED);
         zk.create("/foo_q1", "foobar1".getBytes(), Ids.OPEN_ACL_UNSAFE,
                 CreateMode.PERSISTENT);
         Assert.assertEquals(new String(zk.getData("/foo_q1", null, null)), "foobar1");
@@ -655,12 +672,98 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
         q1.start();
         // Let the notifications timeout
         Thread.sleep(30000);
-        long start = System.currentTimeMillis();
+        long start = Time.currentElapsedTime();
         q1.shutdown();
-        long end = System.currentTimeMillis();
+        long end = Time.currentElapsedTime();
         if ((end - start) > maxwait) {
             Assert.fail("QuorumPeer took " + (end - start) +
                     " to shutdown, expected " + maxwait);
         }
     }
+
+    /**
+     * Test verifies that the server is able to redefine the min/max session
+     * timeouts
+     */
+    @Test
+    public void testMinMaxSessionTimeOut() throws Exception {
+        ClientBase.setupTestEnv();
+
+        final int CLIENT_PORT_QP1 = PortAssignment.unique();
+        final int CLIENT_PORT_QP2 = PortAssignment.unique();
+
+        String quorumCfgSection = "server.1=127.0.0.1:"
+                + PortAssignment.unique() + ":" + PortAssignment.unique()
+                + "\nserver.2=127.0.0.1:" + PortAssignment.unique() + ":"
+                + PortAssignment.unique();
+
+        final int minSessionTimeOut = 10000;
+        final int maxSessionTimeOut = 15000;
+        final String configs = "maxSessionTimeout=" + maxSessionTimeOut + "\n"
+                + "minSessionTimeout=" + minSessionTimeOut + "\n";
+
+        MainThread q1 = new MainThread(1, CLIENT_PORT_QP1, quorumCfgSection,
+                configs);
+        MainThread q2 = new MainThread(2, CLIENT_PORT_QP2, quorumCfgSection,
+                configs);
+        q1.start();
+        q2.start();
+
+        Assert.assertTrue("waiting for server 1 being up", ClientBase
+                .waitForServerUp("127.0.0.1:" + CLIENT_PORT_QP1,
+                        CONNECTION_TIMEOUT));
+        Assert.assertTrue("waiting for server 2 being up", ClientBase
+                .waitForServerUp("127.0.0.1:" + CLIENT_PORT_QP2,
+                        CONNECTION_TIMEOUT));
+
+        QuorumPeer quorumPeer = q1.main.quorumPeer;
+
+        Assert.assertEquals("minimumSessionTimeOut is not considered",
+                minSessionTimeOut, quorumPeer.getMinSessionTimeout());
+        Assert.assertEquals("maximumSessionTimeOut is not considered",
+                maxSessionTimeOut, quorumPeer.getMaxSessionTimeout());
+    }
+
+    /**
+     * Test verifies that the server is able to redefine if user configured only
+     * minSessionTimeout limit
+     */
+    @Test
+    public void testWithOnlyMinSessionTimeout() throws Exception {
+        ClientBase.setupTestEnv();
+
+        final int CLIENT_PORT_QP1 = PortAssignment.unique();
+        final int CLIENT_PORT_QP2 = PortAssignment.unique();
+
+        String quorumCfgSection = "server.1=127.0.0.1:"
+                + PortAssignment.unique() + ":" + PortAssignment.unique()
+                + "\nserver.2=127.0.0.1:" + PortAssignment.unique() + ":"
+                + PortAssignment.unique();
+
+        final int minSessionTimeOut = 15000;
+        final String configs = "minSessionTimeout=" + minSessionTimeOut + "\n";
+
+        MainThread q1 = new MainThread(1, CLIENT_PORT_QP1, quorumCfgSection,
+                configs);
+        MainThread q2 = new MainThread(2, CLIENT_PORT_QP2, quorumCfgSection,
+                configs);
+        q1.start();
+        q2.start();
+
+        Assert.assertTrue("waiting for server 1 being up", ClientBase
+                .waitForServerUp("127.0.0.1:" + CLIENT_PORT_QP1,
+                        CONNECTION_TIMEOUT));
+        Assert.assertTrue("waiting for server 2 being up", ClientBase
+                .waitForServerUp("127.0.0.1:" + CLIENT_PORT_QP2,
+                        CONNECTION_TIMEOUT));
+
+        QuorumPeer quorumPeer = q1.main.quorumPeer;
+        final int maxSessionTimeOut = quorumPeer.tickTime * 20;
+
+        Assert.assertEquals("minimumSessionTimeOut is not considered",
+                minSessionTimeOut, quorumPeer.getMinSessionTimeout());
+        Assert.assertEquals("maximumSessionTimeOut is wrong",
+                maxSessionTimeOut, quorumPeer.getMaxSessionTimeout());
+    }
+
 }

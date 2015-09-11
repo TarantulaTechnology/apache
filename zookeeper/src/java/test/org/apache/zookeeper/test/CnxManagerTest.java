@@ -18,6 +18,9 @@
 
 package org.apache.zookeeper.test;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.net.InetSocketAddress;
@@ -30,13 +33,16 @@ import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import java.net.Socket;
 
+import org.apache.zookeeper.common.Time;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.zookeeper.PortAssignment;
 import org.apache.zookeeper.ZKTestCase;
 import org.apache.zookeeper.server.quorum.QuorumCnxManager;
 import org.apache.zookeeper.server.quorum.QuorumCnxManager.Message;
+import org.apache.zookeeper.server.quorum.QuorumCnxManager.InitialMessage;
 import org.apache.zookeeper.server.quorum.QuorumPeer;
+import org.apache.zookeeper.server.quorum.QuorumPeer.LearnerType;
 import org.apache.zookeeper.server.quorum.QuorumPeer.QuorumServer;
 import org.apache.zookeeper.server.quorum.QuorumPeer.ServerState;
 import org.junit.Assert;
@@ -65,10 +71,13 @@ public class CnxManagerTest extends ZKTestCase {
             peerQuorumPort[i] = PortAssignment.unique();
             peerClientPort[i] = PortAssignment.unique();
             peers.put(Long.valueOf(i),
-                    new QuorumServer(i,
-                            new InetSocketAddress(peerQuorumPort[i]),
-                    new InetSocketAddress(PortAssignment.unique()), 
-                    new InetSocketAddress(peerClientPort[i])));
+                new QuorumServer(i,
+                    new InetSocketAddress(
+                        "127.0.0.1", peerQuorumPort[i]),
+                    new InetSocketAddress(
+                        "127.0.0.1", PortAssignment.unique()),
+                    new InetSocketAddress(
+                        "127.0.0.1", peerClientPort[i])));
             peerTmpdir[i] = ClientBase.createTmpDir();
         }
     }
@@ -170,7 +179,8 @@ public class CnxManagerTest extends ZKTestCase {
             if(thread.failed)
                 Assert.fail("Did not receive expected message");
         }
-
+        cnxManager.halt();
+        Assert.assertFalse(cnxManager.listener.isAlive());
     }
 
     @Test
@@ -198,12 +208,13 @@ public class CnxManagerTest extends ZKTestCase {
             LOG.error("Null listener when initializing cnx manager");
         }
 
-        long begin = System.currentTimeMillis();
+        long begin = Time.currentElapsedTime();
         cnxManager.toSend(2L, createMsg(ServerState.LOOKING.ordinal(), 1, -1, 1));
-        long end = System.currentTimeMillis();
+        long end = Time.currentElapsedTime();
 
         if((end - begin) > 6000) Assert.fail("Waited more than necessary");
-
+        cnxManager.halt();
+        Assert.assertFalse(cnxManager.listener.isAlive());
     }
 
     /**
@@ -235,9 +246,9 @@ public class CnxManagerTest extends ZKTestCase {
 
         InetSocketAddress otherAddr = peers.get(new Long(2)).electionAddr;
         DataOutputStream dout = new DataOutputStream(sc.socket().getOutputStream());
-        dout.writeLong(0xffff0000);
+        dout.writeLong(QuorumCnxManager.PROTOCOL_VERSION);
         dout.writeLong(new Long(2));
-        String addr = otherAddr.getHostName()+ ":" + otherAddr.getPort();
+        String addr = otherAddr.getHostString()+ ":" + otherAddr.getPort();
         byte[] addr_bytes = addr.getBytes();
         dout.writeInt(addr_bytes.length);
         dout.write(addr_bytes);
@@ -266,6 +277,61 @@ public class CnxManagerTest extends ZKTestCase {
         }
         peer.shutdown();
         cnxManager.halt();
+        Assert.assertFalse(cnxManager.listener.isAlive());
+    }
+
+    /**
+     * Tests a bug in QuorumCnxManager that causes a NPE when a 3.4.6
+     * observer connects to a 3.5.0 server. 
+     * {@link https://issues.apache.org/jira/browse/ZOOKEEPER-1789}
+     * 
+     * @throws Exception
+     */
+    @Test
+    public void testCnxManagerNPE() throws Exception {
+        // the connecting peer (id = 2) is a 3.4.6 observer
+        peers.get(2L).type = LearnerType.OBSERVER;
+        QuorumPeer peer = new QuorumPeer(peers, peerTmpdir[1], peerTmpdir[1],
+                peerClientPort[1], 3, 1, 1000, 2, 2);
+        QuorumCnxManager cnxManager = new QuorumCnxManager(peer);
+        QuorumCnxManager.Listener listener = cnxManager.listener;
+        if (listener != null) {
+            listener.start();
+        } else {
+            LOG.error("Null listener when initializing cnx manager");
+        }
+        int port = peers.get(peer.getId()).electionAddr.getPort();
+        LOG.info("Election port: " + port);
+
+        Thread.sleep(1000);
+
+        SocketChannel sc = SocketChannel.open();
+        sc.socket().connect(peers.get(1L).electionAddr, 5000);
+
+        /*
+         * Write id (3.4.6 protocol). This previously caused a NPE in
+         * QuorumCnxManager.
+         */
+        byte[] msgBytes = new byte[8];
+        ByteBuffer msgBuffer = ByteBuffer.wrap(msgBytes);
+        msgBuffer.putLong(2L);
+        msgBuffer.position(0);
+        sc.write(msgBuffer);
+
+        msgBuffer = ByteBuffer.wrap(new byte[8]);
+        // write length of message
+        msgBuffer.putInt(4);
+        // write message
+        msgBuffer.putInt(5);
+        msgBuffer.position(0);
+        sc.write(msgBuffer);
+
+        Message m = cnxManager.pollRecvQueue(1000, TimeUnit.MILLISECONDS);
+        Assert.assertNotNull(m);
+
+        peer.shutdown();
+        cnxManager.halt();
+        Assert.assertFalse(cnxManager.listener.isAlive());
     }
 
     /*
@@ -287,11 +353,13 @@ public class CnxManagerTest extends ZKTestCase {
 
         Socket sock = new Socket();
         sock.connect(peers.get(1L).electionAddr, 5000);
-        long begin = System.currentTimeMillis();
+        long begin = Time.currentElapsedTime();
         // Read without sending data. Verify timeout.
         cnxManager.receiveConnection(sock);
-        long end = System.currentTimeMillis();
+        long end = Time.currentElapsedTime();
         if((end - begin) > ((peer.getSyncLimit() * peer.getTickTime()) + 500)) Assert.fail("Waited more than necessary");
+        cnxManager.halt();
+        Assert.assertFalse(cnxManager.listener.isAlive());
     }
 
     /*
@@ -368,5 +436,86 @@ public class CnxManagerTest extends ZKTestCase {
             }
         }
         return null;
+    }
+
+    @Test
+    public void testInitialMessage() throws Exception {
+        InitialMessage msg;
+        ByteArrayOutputStream bos;
+        DataInputStream din;
+        DataOutputStream dout;
+        String hostport;
+
+        // message with bad protocol version
+        try {
+
+            // the initial message (without the protocol version)
+            hostport = "10.0.0.2:3888";
+            bos = new ByteArrayOutputStream();
+            dout = new DataOutputStream(bos);
+            dout.writeLong(5L); // sid
+            dout.writeInt(hostport.getBytes().length);
+            dout.writeBytes(hostport);
+
+            // now parse it
+            din = new DataInputStream(new ByteArrayInputStream(bos.toByteArray()));
+            msg = InitialMessage.parse(-65530L, din);
+            Assert.fail("bad protocol version accepted");
+        } catch (InitialMessage.InitialMessageException ex) {}
+
+        // message too long
+        try {
+
+            hostport = createLongString(1048576);
+            bos = new ByteArrayOutputStream();
+            dout = new DataOutputStream(bos);
+            dout.writeLong(5L); // sid
+            dout.writeInt(hostport.getBytes().length);
+            dout.writeBytes(hostport);
+
+            din = new DataInputStream(new ByteArrayInputStream(bos.toByteArray()));
+            msg = InitialMessage.parse(QuorumCnxManager.PROTOCOL_VERSION, din);
+            Assert.fail("long message accepted");
+        } catch (InitialMessage.InitialMessageException ex) {}
+
+        // bad hostport string
+        try {
+
+            hostport = "what's going on here?";
+            bos = new ByteArrayOutputStream();
+            dout = new DataOutputStream(bos);
+            dout.writeLong(5L); // sid
+            dout.writeInt(hostport.getBytes().length);
+            dout.writeBytes(hostport);
+
+            din = new DataInputStream(new ByteArrayInputStream(bos.toByteArray()));
+            msg = InitialMessage.parse(QuorumCnxManager.PROTOCOL_VERSION, din);
+            Assert.fail("bad hostport accepted");
+        } catch (InitialMessage.InitialMessageException ex) {}
+
+        // good message
+        try {
+
+            hostport = "10.0.0.2:3888";
+            bos = new ByteArrayOutputStream();
+            dout = new DataOutputStream(bos);
+            dout.writeLong(5L); // sid
+            dout.writeInt(hostport.getBytes().length);
+            dout.writeBytes(hostport);
+
+            // now parse it
+            din = new DataInputStream(new ByteArrayInputStream(bos.toByteArray()));
+            msg = InitialMessage.parse(QuorumCnxManager.PROTOCOL_VERSION, din);
+        } catch (InitialMessage.InitialMessageException ex) {
+            Assert.fail(ex.toString());
+        }
+    }
+
+    private String createLongString(int size) {
+        StringBuilder sb = new StringBuilder(size);
+        for (int i=0; i < size; i++) {
+            sb.append('x');
+        }
+        return sb.toString();
     }
 }

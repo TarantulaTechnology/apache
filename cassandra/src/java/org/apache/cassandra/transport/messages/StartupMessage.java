@@ -17,17 +17,15 @@
  */
 package org.apache.cassandra.transport.messages;
 
+import java.util.HashMap;
 import java.util.Map;
 
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
+import io.netty.buffer.ByteBuf;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.*;
-import org.apache.cassandra.utils.SemanticVersion;
+import org.apache.cassandra.utils.CassandraVersion;
 
 /**
  * The initial message of the protocol.
@@ -40,12 +38,12 @@ public class StartupMessage extends Message.Request
 
     public static final Message.Codec<StartupMessage> codec = new Message.Codec<StartupMessage>()
     {
-        public StartupMessage decode(ChannelBuffer body, int version)
+        public StartupMessage decode(ByteBuf body, int version)
         {
-            return new StartupMessage(CBUtil.readStringMap(body));
+            return new StartupMessage(upperCaseKeys(CBUtil.readStringMap(body)));
         }
 
-        public void encode(StartupMessage msg, ChannelBuffer dest, int version)
+        public void encode(StartupMessage msg, ByteBuf dest, int version)
         {
             CBUtil.writeStringMap(msg.options, dest);
         }
@@ -66,22 +64,19 @@ public class StartupMessage extends Message.Request
 
     public Message.Response execute(QueryState state)
     {
-        ClientState cState = state.getClientState();
         String cqlVersion = options.get(CQL_VERSION);
         if (cqlVersion == null)
             throw new ProtocolException("Missing value CQL_VERSION in STARTUP message");
 
         try 
         {
-            cState.setCQLVersion(cqlVersion);
+            if (new CassandraVersion(cqlVersion).compareTo(new CassandraVersion("2.99.0")) < 0)
+                throw new ProtocolException(String.format("CQL version %s is not supported by the binary protocol (supported version are >= 3.0.0)", cqlVersion));
         }
-        catch (InvalidRequestException e)
+        catch (IllegalArgumentException e)
         {
             throw new ProtocolException(e.getMessage());
         }
-
-        if (cState.getCQLVersion().compareTo(new SemanticVersion("2.99.0")) < 0)
-            throw new ProtocolException(String.format("CQL version %s is not supported by the binary protocol (supported version are >= 3.0.0)", cqlVersion));
 
         if (options.containsKey(COMPRESSION))
         {
@@ -106,6 +101,14 @@ public class StartupMessage extends Message.Request
             return new AuthenticateMessage(DatabaseDescriptor.getAuthenticator().getClass().getName());
         else
             return new ReadyMessage();
+    }
+
+    private static Map<String, String> upperCaseKeys(Map<String, String> options)
+    {
+        Map<String, String> newMap = new HashMap<String, String>(options.size());
+        for (Map.Entry<String, String> entry : options.entrySet())
+            newMap.put(entry.getKey().toUpperCase(), entry.getValue());
+        return newMap;
     }
 
     @Override

@@ -21,13 +21,14 @@ package org.apache.zookeeper.test;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.apache.zookeeper.PortAssignment;
 import org.apache.zookeeper.server.quorum.Election;
 import org.apache.zookeeper.server.quorum.QuorumPeer;
@@ -35,6 +36,8 @@ import org.apache.zookeeper.server.quorum.QuorumPeer.LearnerType;
 import org.apache.zookeeper.server.quorum.QuorumPeer.QuorumServer;
 import org.apache.zookeeper.server.util.OSMXBean;
 import org.junit.Assert;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Utility for quorum testing. Setups 2n+1 peers and allows to start/stop all
@@ -73,13 +76,15 @@ public class QuorumUtil {
 
     private int electionAlg;
 
+    private boolean localSessionEnabled;
+
     /**
      * Initializes 2n+1 quorum peers which will form a ZooKeeper ensemble.
      *
      * @param n
      *            number of peers in the ensemble will be 2n+1
      */
-    public QuorumUtil(int n) throws RuntimeException {
+    public QuorumUtil(int n, int syncLimit) throws RuntimeException {
         try {
             ClientBase.setupTestEnv();
             JMXEnv.setUp();
@@ -88,7 +93,7 @@ public class QuorumUtil {
             ALL = 2 * N + 1;
             tickTime = 2000;
             initLimit = 3;
-            syncLimit = 3;
+            this.syncLimit = syncLimit;
             electionAlg = 3;
             hostPort = "";
 
@@ -100,8 +105,8 @@ public class QuorumUtil {
                 peers.put(i, ps);
 
                 peersView.put(Long.valueOf(i), new QuorumServer(i, 
-                               new InetSocketAddress("127.0.0.1", PortAssignment.unique() + 1000), 
-                               new InetSocketAddress("127.0.0.1", PortAssignment.unique() + 1000), 
+                               new InetSocketAddress("127.0.0.1", PortAssignment.unique()),
+                               new InetSocketAddress("127.0.0.1", PortAssignment.unique()),
                                new InetSocketAddress("127.0.0.1", ps.clientPort), 
                                LearnerType.PARTICIPANT));
                 hostPort += "127.0.0.1:" + ps.clientPort + ((i == ALL) ? "" : ",");
@@ -118,6 +123,10 @@ public class QuorumUtil {
         }
     }
 
+    public QuorumUtil(int n) throws RuntimeException {
+        this(n, 3);
+    }
+
     public PeerStruct getPeer(int id) {
         return peers.get(id);
     }
@@ -125,6 +134,11 @@ public class QuorumUtil {
     // This was added to avoid running into the problem of ZOOKEEPER-1539
     public boolean disableJMXTest = false;
     
+
+    public void enableLocalSession(boolean localSessionEnabled) {
+        this.localSessionEnabled = localSessionEnabled;
+    }
+
     public void startAll() throws IOException {
         shutdownAll();
         for (int i = 1; i <= ALL; ++i) {
@@ -165,6 +179,8 @@ public class QuorumUtil {
             JMXEnv.ensureAll(ensureNames.toArray(new String[ensureNames.size()]));
         } catch (IOException e) {
             LOG.warn("IOException during JMXEnv operation", e);
+        } catch (InterruptedException e) {
+            LOG.warn("InterruptedException during JMXEnv operation", e);
         }
     }
 
@@ -187,6 +203,9 @@ public class QuorumUtil {
         LOG.info("Creating QuorumPeer " + ps.id + "; public port " + ps.clientPort);
         ps.peer = new QuorumPeer(peersView, ps.dataDir, ps.dataDir, ps.clientPort, electionAlg,
                 ps.id, tickTime, initLimit, syncLimit);
+        if (localSessionEnabled) {
+            ps.peer.enableLocalSessions(true);
+        }
         Assert.assertEquals(ps.clientPort, ps.peer.getClientPort());
 
         ps.peer.start();
@@ -203,6 +222,9 @@ public class QuorumUtil {
         LOG.info("Creating QuorumPeer " + ps.id + "; public port " + ps.clientPort);
         ps.peer = new QuorumPeer(peersView, ps.dataDir, ps.dataDir, ps.clientPort, electionAlg,
                 ps.id, tickTime, initLimit, syncLimit);
+        if (localSessionEnabled) {
+            ps.peer.enableLocalSessions(true);
+        }
         Assert.assertEquals(ps.clientPort, ps.peer.getClientPort());
 
         ps.peer.start();
@@ -248,6 +270,31 @@ public class QuorumUtil {
         return hostPort;
     }
 
+    public String getConnectString(QuorumPeer peer) {
+        return "127.0.0.1:" + peer.getClientPort();
+    }
+
+    public QuorumPeer getLeaderQuorumPeer() {
+        for (PeerStruct ps: peers.values()) {
+            if (ps.peer.leader != null) {
+               return ps.peer;
+            }
+        }
+        throw new RuntimeException("Unable to find a leader peer");
+    }
+
+    public List<QuorumPeer> getFollowerQuorumPeers() {
+        List<QuorumPeer> peerList = new ArrayList<QuorumPeer>(ALL - 1); 
+
+        for (PeerStruct ps: peers.values()) {
+            if (ps.peer.leader == null) {
+               peerList.add(ps.peer);      
+            }
+        }
+
+        return Collections.unmodifiableList(peerList);
+    }
+
     public void tearDown() throws Exception {
         LOG.info("TearDown started");
 
@@ -258,5 +305,22 @@ public class QuorumUtil {
 
         shutdownAll();
         JMXEnv.tearDown();
+    }
+
+    public int getLeaderServer() {
+        int index = 0;
+        for (int i = 1; i <= ALL; i++) {
+            if (getPeer(i).peer.leader != null) {
+                index = i;
+                break;
+            }
+        }
+
+        Assert.assertTrue("Leader server not found.", index > 0);
+        return index;
+    }
+
+    public String getConnectionStringForServer(final int index) {
+        return "127.0.0.1:" + getPeer(index).clientPort;
     }
 }

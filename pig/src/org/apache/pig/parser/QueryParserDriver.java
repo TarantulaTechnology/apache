@@ -47,12 +47,15 @@ import org.apache.pig.impl.PigContext;
 import org.apache.pig.impl.io.FileLocalizer;
 import org.apache.pig.impl.io.FileLocalizer.FetchFileRet;
 import org.apache.pig.impl.io.ResourceNotFoundException;
+import org.apache.pig.impl.logicalLayer.FrontendException;
 import org.apache.pig.newplan.Operator;
 import org.apache.pig.newplan.logical.relational.LogicalPlan;
 import org.apache.pig.newplan.logical.relational.LogicalSchema;
 import org.apache.pig.parser.QueryParser.literal_return;
 import org.apache.pig.parser.QueryParser.schema_return;
 import org.apache.pig.tools.pigstats.ScriptState;
+import org.apache.pig.validator.BlackAndWhitelistFilter;
+import org.apache.pig.validator.PigCommandFilter;
 
 public class QueryParserDriver {
     private static final Log LOG = LogFactory.getLog(QueryParserDriver.class);
@@ -367,8 +370,17 @@ public class QueryParserDriver {
     private boolean expandImport(Tree ast) throws ParserException {
         List<CommonTree> nodes = new ArrayList<CommonTree>();
         traverseImport(ast, nodes);
-        if (nodes.isEmpty()) return false;
+        if (nodes.isEmpty())
+            return false;
 
+        // Validate if imports are enabled/disabled
+        final BlackAndWhitelistFilter filter = new BlackAndWhitelistFilter(
+                this.pigContext);
+        try {
+            filter.validate(PigCommandFilter.Command.IMPORT);
+        } catch (FrontendException e) {
+            throw new ParserException(e.getMessage());
+        }
         for (CommonTree t : nodes) {
             macroImport(t);
         }
@@ -491,7 +503,7 @@ public class QueryParserDriver {
 
         // sometimes the script has no filename, like when a string is passed to PigServer for
         // example. See PIG-2866.
-        if (fname != null) {
+        if (!fname.isEmpty()) {
             FetchFileRet localFileRet = getMacroFile(fname);
             fname = localFileRet.file.getAbsolutePath();
         }
@@ -562,6 +574,7 @@ public class QueryParserDriver {
 
             String macroText = null;
             try {
+                in.close();
                 in = new BufferedReader(new StringReader(sb.toString()));
                 macroText = pigContext.doParamSubstitution(in);
             } catch (IOException e) {
@@ -594,7 +607,7 @@ public class QueryParserDriver {
             ScriptState ss = ScriptState.get();
             if (ss != null) file = ss.getFileName();
         }
-        if (file != null && !file.equals(importFile)) {
+        if (!file.isEmpty() && !file.equals(importFile)) {
             sb.append("at ").append(file).append(", ");
         }
         sb.append("line ").append(t.getLine()).append("> ").append(header);

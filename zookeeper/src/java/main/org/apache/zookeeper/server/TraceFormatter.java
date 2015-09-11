@@ -29,14 +29,20 @@ import org.apache.zookeeper.ZooDefs.OpCode;
 
 public class TraceFormatter {
 
-    static String op2String(int op) {
+    public static String op2String(int op) {
         switch (op) {
         case OpCode.notification:
             return "notification";
         case OpCode.create:
             return "create";
+        case OpCode.create2:
+            return "create2";
+        case OpCode.createContainer:
+            return "createContainer";
         case OpCode.delete:
             return "delete";
+        case OpCode.deleteContainer:
+            return "deleteContainer";
         case OpCode.exists:
             return "exists";
         case OpCode.getData:
